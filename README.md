@@ -10,9 +10,10 @@ A tiny iPhone-friendly PWA: point the camera at a page, freeze the frame, tap a 
 
 1. Open the site in Safari on your iPhone (HTTPS required for the camera).
 2. Tap **Open camera** and allow camera access.
-3. Press the shutter. Word Lens reads the page and boxes each word.
+3. Press the shutter. Word Lens straightens the page if needed and boxes less-common words.
 4. Tap a word to see its phonetic, part of speech, and definitions.
-5. Tap **Retake** to go back to the live camera.
+5. Tap **Show all** if you want boxes on common words too.
+6. Tap **Retake** to go back to the live camera.
 
 To install it as an app: in Safari, tap Share → Add to Home Screen.
 
@@ -22,6 +23,8 @@ To install it as an app: in Safari, tap Share → Add to Home Screen.
 - OCR runs entirely in the browser with Tesseract.js (English).
 - Definitions come from [Free Dictionary API](https://dictionaryapi.dev/).
 - Low-confidence and non-alphabetic tokens are ignored.
+- Sideways, upside-down, and moderately skewed photos are straightened for reading; boxes are mapped back onto the original photo.
+- Very common words (the top 3,000 from the [Google Trillion Word Corpus list](https://github.com/first20hours/google-10000-english)) and very short words are hidden by default.
 
 ## Local development
 

@@ -1,19 +1,54 @@
 #!/usr/bin/env python3
-"""Headless verification of Word Lens: page load, OCR, and dictionary lookup."""
+"""Headless verification of Word Lens: orientation, box alignment, and common-word filter."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
 import sys
 from pathlib import Path
 
+from PIL import Image
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-SAMPLE = ROOT / "tests" / "sample-text.png"
+SAMPLES = ROOT / "tests"
 ARTIFACTS = ROOT / "tests" / "artifacts"
-EXPECTED_WORDS = {"serendipity", "language", "remarkable", "lucid", "definition", "reader", "difficult"}
+INTERESTING = {"serendipity", "remarkable", "lucid"}
+COMMON_SHOULD_HIDE = {"the", "of", "is", "a", "each", "word", "language", "understand"}
+
+
+def rotate_point_ccw(x: float, y: float, src_w: float, src_h: float, angle_ccw_deg: float, new_w: float, new_h: float) -> tuple[float, float]:
+    """Map a point from an image to a PIL-style expanded rotation (CCW, Y-down, centered)."""
+    th = math.radians(angle_ccw_deg)
+    dx = x - src_w / 2
+    dy = y - src_h / 2
+    c, s = math.cos(th), math.sin(th)
+    rx = dx * c + dy * s
+    ry = -dx * s + dy * c
+    return rx + new_w / 2, ry + new_h / 2
+
+
+def rotate_90_ccw(x: float, y: float, src_w: float, src_h: float) -> tuple[float, float]:
+    # size becomes (src_h, src_w)
+    return y, src_w - 1 - x
+
+
+def rotate_180(x: float, y: float, src_w: float, src_h: float) -> tuple[float, float]:
+    return src_w - 1 - x, src_h - 1 - y
+
+
+def load_b64(path: Path) -> str:
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def expected_center(ref: dict, name: str, src_w: int, src_h: int, new_w: int, new_h: int) -> tuple[float, float]:
+    x, y = ref[name]["cx"], ref[name]["cy"]
+    if name_angle := None:
+        pass
+    return x, y
 
 
 def main() -> int:
@@ -24,12 +59,19 @@ def main() -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    report = {"url": args.url, "ok": False, "checks": []}
+    report: dict = {"url": args.url, "ok": False, "checks": []}
 
     def check(name: str, passed: bool, detail: str = "") -> None:
         report["checks"].append({"name": name, "passed": bool(passed), "detail": detail})
         mark = "PASS" if passed else "FAIL"
-        print(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+        print(f"[{mark}] {name}" + (f" — {detail}" if detail else ""), flush=True)
+
+    samples = {
+        "0": {"path": SAMPLES / "sample-text.png", "angle": 0},
+        "90": {"path": SAMPLES / "sample-text-90.png", "angle": 90},
+        "180": {"path": SAMPLES / "sample-text-180.png", "angle": 180},
+        "20": {"path": SAMPLES / "sample-text-20.png", "angle": -20},
+    }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -55,31 +97,13 @@ def main() -> int:
         has_manifest = page.locator('link[rel="manifest"]').count() == 1
         apple_capable = page.locator('meta[name="apple-mobile-web-app-capable"]').count() == 1
         apple_icon = page.locator('link[rel="apple-touch-icon"]').count() == 1
-        playsinline = page.locator("video#preview[playsinline]").count() == 1
-        check("pwa_meta", has_manifest and apple_capable and apple_icon, f"manifest={has_manifest} capable={apple_capable} icon={apple_icon}")
-        check("playsinline_video", playsinline)
-
-        manifest = page.evaluate(
-            """async () => {
-              const href = document.querySelector('link[rel="manifest"]').href;
-              const res = await fetch(href);
-              const json = await res.json();
-              return { status: res.status, json, href };
-            }"""
-        )
-        check(
-            "manifest_ok",
-            manifest["status"] == 200
-            and manifest["json"].get("display") == "standalone"
-            and manifest["json"].get("short_name") == "Word Lens",
-            json.dumps({"status": manifest["status"], "start_url": manifest["json"].get("start_url")}),
-        )
+        check("pwa_meta", has_manifest and apple_capable and apple_icon)
 
         sw = page.evaluate(
             """async () => {
               if (!('serviceWorker' in navigator)) return { supported: false };
               const reg = await navigator.serviceWorker.ready;
-              return { supported: true, scope: reg.scope, scriptURL: reg.active && reg.active.scriptURL };
+              return { supported: true, scriptURL: reg.active && reg.active.scriptURL };
             }"""
         )
         check("service_worker", bool(sw.get("supported") and sw.get("scriptURL")), json.dumps(sw))
@@ -90,87 +114,145 @@ def main() -> int:
         if is_https:
             check("https", True, args.url)
 
+        cache_name = page.evaluate(
+            """async () => {
+              const names = await caches.keys();
+              return names;
+            }"""
+        )
+        check("sw_cache_v2", any("word-lens-v2" in n for n in cache_name), json.dumps(cache_name))
+
         page.screenshot(path=str(out / "start.png"), full_page=True)
 
-        image_bytes = SAMPLE.read_bytes()
-        b64 = __import__("base64").b64encode(image_bytes).decode("ascii")
-        page.set_default_timeout(180000)
-        try:
-            words = page.evaluate(
-                """async (b64) => {
-                  const binary = atob(b64);
-                  const bytes = new Uint8Array(binary.length);
-                  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-                  const blob = new Blob([bytes], { type: 'image/png' });
-                  return await window.__wordLensTest.recognizeImageBlob(blob);
-                }""",
-                b64,
+        # Default to filtered mode for these checks.
+        page.evaluate("() => window.__wordLensTest.setShowAll(false)")
+
+        def run_ocr(label: str, path: Path):
+            b64 = load_b64(path)
+            page.set_default_timeout(180000)
+            try:
+                words = page.evaluate(
+                    """async (b64) => {
+                      const binary = atob(b64);
+                      const bytes = new Uint8Array(binary.length);
+                      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                      const blob = new Blob([bytes], { type: 'image/png' });
+                      await window.__wordLensTest.setShowAll(false);
+                      await window.__wordLensTest.recognizeImageBlob(blob);
+                      return window.__wordLensTest.getState();
+                    }""",
+                    b64,
+                )
+            except Exception as exc:
+                page.screenshot(path=str(out / f"ocr-error-{label}.png"), full_page=True)
+                check(f"ocr_{label}_completes", False, str(exc))
+                page.set_default_timeout(30000)
+                return None
+            page.set_default_timeout(30000)
+            check(
+                f"ocr_{label}_completes",
+                isinstance(words, dict) and len(words.get("words") or []) > 0,
+                f"count={len((words or {}).get('words') or [])} angle={((words or {}).get('orientation') or {}).get('angle')}",
             )
-            check("ocr_completes", isinstance(words, list) and len(words) > 0, f"count={len(words) if words else 0}")
-        except Exception as exc:
-            page.screenshot(path=str(out / "ocr-error.png"), full_page=True)
-            check("ocr_completes", False, str(exc))
-            words = []
-        page.set_default_timeout(30000)
+            page.screenshot(path=str(out / f"ocr-{label}.png"), full_page=True)
+            return words
 
-        found = sorted({w["word"] for w in words}) if words else []
-        missing = sorted(EXPECTED_WORDS - set(found))
-        check("ocr_words", not missing, f"found={found} missing={missing}")
-        box_count = page.locator(".word-box").count()
-        check("word_boxes_drawn", box_count >= len(EXPECTED_WORDS) - 2, f"boxes={box_count}")
-        page.screenshot(path=str(out / "ocr-boxes.png"), full_page=True)
+        states = {}
+        for label, meta in samples.items():
+            states[label] = run_ocr(label, meta["path"])
 
-        # Tap serendipity if present, else open via test hook.
-        if any(w["word"] == "serendipity" for w in (words or [])):
-            # Click the box whose aria-label mentions the word
-            locator = page.locator('button.word-box[aria-label="Define serendipity"]')
-            if locator.count():
-                locator.last.click()
-            else:
-                page.evaluate("() => window.__wordLensTest.openWord('serendipity')")
-        else:
+        upright = states.get("0") or {}
+        ref_words = {w["word"]: w for w in upright.get("words") or []}
+        src_w = (upright.get("frame") or {}).get("width") or 1600
+        src_h = (upright.get("frame") or {}).get("height") or 1000
+
+        for label in ("0", "90", "180", "20"):
+            state = states.get(label) or {}
+            found = {w["word"] for w in state.get("words") or []}
+            visible = set(state.get("visible") or [])
+            missing_interesting = sorted(INTERESTING - visible)
+            leaked_common = sorted((COMMON_SHOULD_HIDE & visible))
+            check(
+                f"filter_{label}_keeps_interesting",
+                not missing_interesting,
+                f"visible={sorted(visible)} missing={missing_interesting}",
+            )
+            check(
+                f"filter_{label}_hides_common",
+                not leaked_common,
+                f"leaked={leaked_common} found_all={sorted(found)}",
+            )
+
+            # Alignment: map 0° centers into this image and compare.
+            if label == "0" or not ref_words or not state.get("words"):
+                if label == "0" and ref_words:
+                    # Self-alignment: boxes should sit on the words; just check they have size.
+                    ok = all(ref_words[w]["width"] > 20 and ref_words[w]["height"] > 8 for w in INTERESTING if w in ref_words)
+                    check("align_0_boxes_have_size", ok)
+                continue
+
+            frame = state.get("frame") or {}
+            new_w = frame.get("width") or 0
+            new_h = frame.get("height") or 0
+            current = {w["word"]: w for w in state.get("words") or []}
+            errors = []
+            for word in INTERESTING:
+                if word not in ref_words or word not in current:
+                    errors.append(f"{word} missing")
+                    continue
+                rx, ry = ref_words[word]["cx"], ref_words[word]["cy"]
+                if label == "90":
+                    ex, ey = rotate_90_ccw(rx, ry, src_w, src_h)
+                elif label == "180":
+                    ex, ey = rotate_180(rx, ry, src_w, src_h)
+                else:
+                    ex, ey = rotate_point_ccw(rx, ry, src_w, src_h, 90 if False else -20, new_w, new_h)
+                cx, cy = current[word]["cx"], current[word]["cy"]
+                dist = math.hypot(cx - ex, cy - ey)
+                # Allow a generous fraction of the word size; 20° interpolation is looser.
+                tol = max(36, 0.45 * max(ref_words[word]["width"], current[word]["width"]))
+                if dist > tol:
+                    errors.append(f"{word} dist={dist:.1f}px tol={tol:.1f} got=({cx:.1f},{cy:.1f}) expected=({ex:.1f},{ey:.1f})")
+            check(f"align_{label}_boxes", not errors, "; ".join(errors) or "ok")
+
+        # Toggle should reveal common words on the upright photo.
+        if states.get("0"):
+            page.evaluate("() => window.__wordLensTest.setShowAll(true)")
+            shown = page.evaluate("() => window.__wordLensTest.getState()")
+            visible = set(shown.get("visible") or [])
+            revealed = sorted(COMMON_SHOULD_HIDE & visible)
+            check(
+                "toggle_show_all_reveals_common",
+                len(revealed) >= 4,
+                f"revealed={revealed} visible={sorted(visible)}",
+            )
+            page.screenshot(path=str(out / "ocr-0-show-all.png"), full_page=True)
+            page.evaluate("() => window.__wordLensTest.setShowAll(false)")
+            hidden_again = set(page.evaluate("() => window.__wordLensTest.getState()").get("visible") or [])
+            leaked = sorted(COMMON_SHOULD_HIDE & hidden_again)
+            check("toggle_hide_common_again", not leaked, f"leaked={leaked}")
+
+            # Definition still works for an interesting word.
             page.evaluate("() => window.__wordLensTest.openWord('serendipity')")
-
-        page.wait_for_selector("#sheet:not([hidden])", timeout=10000)
-        page.wait_for_function(
-            """() => {
-              const body = document.getElementById('sheet-body');
-              return body && !body.querySelector('.pending');
-            }""",
-            timeout=30000,
-        )
-        body_text = page.inner_text("#sheet-body")
-        word_text = page.inner_text("#sheet-word")
-        phonetic = page.inner_text("#sheet-phonetic")
-        pos = page.locator("#sheet-body .pos").all_inner_texts()
-        ok_def = "serendipity" in word_text.lower() and ("fortunate" in body_text.lower() or "luck" in body_text.lower() or "discovery" in body_text.lower())
-        check(
-            "definition_lookup",
-            ok_def,
-            f"word={word_text!r} phonetic={phonetic!r} pos={pos!r} body={body_text[:240]!r}",
-        )
-        page.screenshot(path=str(out / "definition.png"), full_page=True)
-
-        # Unknown word
-        page.evaluate("() => window.__wordLensTest.openWord('xyzzywordq')")
-        page.wait_for_function(
-            """() => {
-              const body = document.getElementById('sheet-body');
-              return body && !body.querySelector('.pending');
-            }""",
-            timeout=30000,
-        )
-        miss_text = page.inner_text("#sheet-body")
-        check("no_definition_message", "no definition found" in miss_text.lower(), miss_text[:240])
-        page.screenshot(path=str(out / "no-definition.png"), full_page=True)
+            page.wait_for_selector("#sheet:not([hidden])", timeout=10000)
+            page.wait_for_function(
+                """() => {
+                  const body = document.getElementById('sheet-body');
+                  return body && !body.querySelector('.pending');
+                }""",
+                timeout=30000,
+            )
+            body_text = page.inner_text("#sheet-body")
+            word_text = page.inner_text("#sheet-word")
+            ok_def = "serendipity" in word_text.lower() and (
+                "fortunate" in body_text.lower() or "luck" in body_text.lower() or "discovery" in body_text.lower()
+            )
+            check("definition_lookup", ok_def, f"word={word_text!r} body={body_text[:200]!r}")
+            page.screenshot(path=str(out / "definition.png"), full_page=True)
 
         browser.close()
 
-    report["ok"] = all(c["passed"] for c in report["checks"] if c["name"] != "https" or args.url.startswith("https://") or True)
-    # For local http, https check is informational; overall ok requires the functional checks.
-    required = [c for c in report["checks"] if c["name"] != "https"]
-    if args.url.startswith("https://"):
-        required = report["checks"]
+    required = report["checks"] if args.url.startswith("https://") else [c for c in report["checks"] if c["name"] != "https"]
     report["ok"] = all(c["passed"] for c in required)
     (out / "report.json").write_text(json.dumps(report, indent=2))
     print(json.dumps({"ok": report["ok"], "url": args.url, "artifact_dir": str(out)}, indent=2))

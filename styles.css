@@ -82,6 +82,8 @@ body.frozen #frame {
   border-radius: 5px;
   pointer-events: auto;
   cursor: pointer;
+  padding: 0;
+  transform-origin: center center;
 }
 
 .word-box::after {
@@ -128,7 +130,8 @@ body.frozen #frame {
 #tap-hint[hidden],
 #boxes[hidden],
 #retake[hidden],
-#shutter[hidden] {
+#shutter[hidden],
+#toggle-common[hidden] {
   display: none !important;
 }
 
@@ -209,12 +212,18 @@ button {
   left: 0;
   right: 0;
   bottom: 0;
-  display: flex;
-  justify-content: center;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
   padding: 12px var(--safe-r) calc(22px + var(--safe-b)) var(--safe-l);
   z-index: 15;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
+}
+
+#shutter,
+#retake {
+  grid-column: 2;
+  justify-self: center;
 }
 
 #shutter {
@@ -248,6 +257,28 @@ button {
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255, 255, 255, 0.18);
   min-width: 132px;
+}
+
+#toggle-common {
+  grid-column: 3;
+  justify-self: end;
+  margin-right: 8px;
+  min-height: 44px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 0.95rem;
+  font-weight: 600;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+#toggle-common[aria-pressed="true"] {
+  background: rgba(232, 197, 114, 0.28);
+  border-color: rgba(232, 197, 114, 0.5);
 }
 
 .spinner {

@@ -1,8 +1,14 @@
 (() => {
   const CONFIDENCE_MIN = 55;
+  const SHORT_WORD_MAX = 2;
   const DICTIONARY_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/";
   const TESSERACT_VERSION = "5.1.1";
   const TESSERACT_CORE = "5.1.1";
+  const ANALYZE_MAX = 400;
+  const FLIP_MAX = 480;
+  const FLIP_CONF_OK = 70;
+  const FLIP_WORDS_OK = 4;
+  const SHOW_ALL_KEY = "word-lens-show-all";
 
   const $ = (id) => document.getElementById(id);
 
@@ -16,6 +22,7 @@
   const controls = $("controls");
   const shutter = $("shutter");
   const retake = $("retake");
+  const toggleCommon = $("toggle-common");
   const tapHint = $("tap-hint");
   const toastEl = $("toast");
   const sheet = $("sheet");
@@ -31,6 +38,29 @@
   let progressHandler = null;
   let toastTimer = null;
   let lookupAbort = null;
+  let commonWords = new Set();
+  let lastWords = [];
+  let lastOrientation = { angle: 0 };
+  let showAll = false;
+  let quietOcr = false;
+
+  try {
+    showAll = localStorage.getItem(SHOW_ALL_KEY) === "1";
+  } catch (err) {
+    showAll = false;
+  }
+
+  const commonReady = fetch("./common-words.json")
+    .then((res) => {
+      if (!res.ok) throw new Error("common list missing");
+      return res.json();
+    })
+    .then((list) => {
+      if (Array.isArray(list)) commonWords = new Set(list.map((w) => String(w).toLowerCase()));
+    })
+    .catch((err) => {
+      console.warn("Common-word list unavailable", err);
+    });
 
   preview.setAttribute("playsinline", "true");
   preview.setAttribute("webkit-playsinline", "true");
@@ -125,6 +155,7 @@
       await startCamera();
       hide(startEl);
       hide(retake);
+      hide(toggleCommon);
       show(shutter);
       show(controls);
       hide(tapHint);
@@ -195,10 +226,42 @@
     return true;
   }
 
+  function isCommonWord(word) {
+    return commonWords.has(word);
+  }
+
+  function isFilteredOut(word) {
+    if (word.length <= SHORT_WORD_MAX) return true;
+    return isCommonWord(word);
+  }
+
+  function visibleWords(words) {
+    if (showAll) return words.slice();
+    return words.filter((w) => !isFilteredOut(w.word));
+  }
+
+  function updateToggleLabel() {
+    toggleCommon.textContent = "Show all";
+    toggleCommon.setAttribute("aria-pressed", showAll ? "true" : "false");
+    toggleCommon.setAttribute("aria-label", showAll ? "Hide common words" : "Show all words");
+  }
+
+  function setShowAll(next) {
+    showAll = !!next;
+    try {
+      localStorage.setItem(SHOW_ALL_KEY, showAll ? "1" : "0");
+    } catch (err) {
+      // ignore quota / private mode
+    }
+    updateToggleLabel();
+    if (lastWords.length) renderBoxes(lastWords);
+  }
+
   function getWorker() {
     if (!workerPromise) {
       const opts = {
         logger: (m) => {
+          if (quietOcr) return;
           if (typeof progressHandler === "function") progressHandler(m);
         },
         workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESSERACT_VERSION}/dist/worker.min.js`,
@@ -213,17 +276,281 @@
     return workerPromise;
   }
 
-  async function recognizeFrame() {
+  function makeScaledCanvas(source, maxSide) {
+    const scale = Math.min(1, maxSide / Math.max(source.width, source.height));
+    const w = Math.max(1, Math.round(source.width * scale));
+    const h = Math.max(1, Math.round(source.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(source, 0, 0, w, h);
+    return canvas;
+  }
+
+  function rotateCanvas(source, angleDeg) {
+    const angle = ((angleDeg % 360) + 360) % 360;
+    if (angle < 0.05 || angle > 359.95) {
+      const copy = document.createElement("canvas");
+      copy.width = source.width;
+      copy.height = source.height;
+      copy.getContext("2d").drawImage(source, 0, 0);
+      return copy;
+    }
+    const rad = (angle * Math.PI) / 180;
+    const w = source.width;
+    const h = source.height;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const out = document.createElement("canvas");
+    out.width = Math.max(1, Math.round(Math.abs(w * c) + Math.abs(h * s)));
+    out.height = Math.max(1, Math.round(Math.abs(w * s) + Math.abs(h * c)));
+    const ctx = out.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(source, -w / 2, -h / 2);
+    return out;
+  }
+
+  function otsuThreshold(hist, total) {
+    let sum = 0;
+    for (let t = 0; t < 256; t += 1) sum += t * hist[t];
+    let sumB = 0;
+    let wB = 0;
+    let max = 0;
+    let thresh = 127;
+    for (let t = 0; t < 256; t += 1) {
+      wB += hist[t];
+      if (!wB) continue;
+      const wF = total - wB;
+      if (!wF) break;
+      sumB += t * hist[t];
+      const mB = sumB / wB;
+      const mF = (sum - sumB) / wF;
+      const between = wB * wF * (mB - mF) * (mB - mF);
+      if (between > max) {
+        max = between;
+        thresh = t;
+      }
+    }
+    return thresh;
+  }
+
+  function binarizeCanvas(source) {
+    const w = source.width;
+    const h = source.height;
+    const srcCtx = source.getContext("2d", { willReadFrequently: true });
+    const img = srcCtx.getImageData(0, 0, w, h);
+    const gray = new Uint8Array(w * h);
+    const hist = new Uint32Array(256);
+    for (let i = 0, p = 0; i < img.data.length; i += 4, p += 1) {
+      const value = (img.data[i] * 299 + img.data[i + 1] * 587 + img.data[i + 2] * 114) / 1000;
+      const g = value < 0 ? 0 : value > 255 ? 255 : value | 0;
+      gray[p] = g;
+      hist[g] += 1;
+    }
+    const thresh = otsuThreshold(hist, w * h);
+    const out = document.createElement("canvas");
+    out.width = w;
+    out.height = h;
+    const ctx = out.getContext("2d", { willReadFrequently: true });
+    const outImg = ctx.createImageData(w, h);
+    for (let p = 0, i = 0; p < gray.length; p += 1, i += 4) {
+      const v = gray[p] < thresh ? 0 : 255;
+      outImg.data[i] = v;
+      outImg.data[i + 1] = v;
+      outImg.data[i + 2] = v;
+      outImg.data[i + 3] = 255;
+    }
+    ctx.putImageData(outImg, 0, 0);
+    return out;
+  }
+
+  function rowSumVariance(ctx, width, height) {
+    const data = ctx.getImageData(0, 0, width, height).data;
+    const sums = new Float64Array(height);
+    let ink = 0;
+    for (let y = 0; y < height; y += 1) {
+      let row = 0;
+      for (let x = 0; x < width; x += 1) {
+        if (data[(y * width + x) * 4] < 128) {
+          row += 1;
+          ink += 1;
+        }
+      }
+      sums[y] = row;
+    }
+    if (ink < 20) return 0;
+    let mean = 0;
+    for (let y = 0; y < height; y += 1) mean += sums[y];
+    mean /= height;
+    let variance = 0;
+    for (let y = 0; y < height; y += 1) {
+      const d = sums[y] - mean;
+      variance += d * d;
+    }
+    return variance / height;
+  }
+
+  function scoreSkewAngle(binary, angleDeg, scratch) {
+    const rad = (angleDeg * Math.PI) / 180;
+    const w = binary.width;
+    const h = binary.height;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const nw = Math.max(1, Math.ceil(Math.abs(w * c) + Math.abs(h * s)));
+    const nh = Math.max(1, Math.ceil(Math.abs(w * s) + Math.abs(h * c)));
+    if (scratch.width < nw || scratch.height < nh) {
+      scratch.width = Math.max(scratch.width, nw);
+      scratch.height = Math.max(scratch.height, nh);
+    }
+    const ctx = scratch.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, scratch.width, scratch.height);
+    ctx.save();
+    ctx.translate(nw / 2, nh / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(binary, -w / 2, -h / 2);
+    ctx.restore();
+    return rowSumVariance(ctx, nw, nh);
+  }
+
+  function findLineAngle(source) {
+    const small = makeScaledCanvas(source, ANALYZE_MAX);
+    const binary = binarizeCanvas(small);
+    const scratch = document.createElement("canvas");
+    scratch.getContext("2d", { willReadFrequently: true });
+    let bestAngle = 0;
+    let bestScore = -1;
+    for (let angle = -45; angle < 135; angle += 5) {
+      const score = scoreSkewAngle(binary, angle, scratch);
+      if (score > bestScore) {
+        bestScore = score;
+        bestAngle = angle;
+      }
+    }
+    const start = bestAngle - 4;
+    const end = bestAngle + 4;
+    for (let angle = start; angle <= end; angle += 1) {
+      if (angle === bestAngle) continue;
+      const score = scoreSkewAngle(binary, angle, scratch);
+      if (score > bestScore) {
+        bestScore = score;
+        bestAngle = angle;
+      }
+    }
+    if (bestScore <= 0) return 0;
+    return bestAngle;
+  }
+
+  function scoreOcrData(data) {
+    const words = (data.words || []).filter((w) => isKeepableToken(w.text, w.confidence ?? 0));
+    const avgConf = words.length
+      ? words.reduce((sum, w) => sum + (w.confidence || 0), 0) / words.length
+      : 0;
+    return {
+      keepable: words.length,
+      avgConf,
+      total: words.length * 8 + avgConf,
+    };
+  }
+
+  async function scoreOcrCanvas(canvas) {
     const worker = await getWorker();
-    const { data } = await worker.recognize(frame);
+    quietOcr = true;
+    try {
+      const { data } = await worker.recognize(canvas);
+      return scoreOcrData(data);
+    } finally {
+      quietOcr = false;
+    }
+  }
+
+  async function chooseReadingAngle(source, lineAngle) {
+    const small = makeScaledCanvas(source, FLIP_MAX);
+    const upright = rotateCanvas(small, lineAngle);
+    const first = await scoreOcrCanvas(upright);
+    if (first.keepable >= FLIP_WORDS_OK && first.avgConf >= FLIP_CONF_OK) {
+      return { angle: lineAngle, score: first };
+    }
+    const flipped = rotateCanvas(small, lineAngle + 180);
+    const second = await scoreOcrCanvas(flipped);
+    if (second.total > first.total) return { angle: lineAngle + 180, score: second };
+    return { angle: lineAngle, score: first };
+  }
+
+  function rotatedToOrig(rx, ry, srcW, srcH, rotW, rotH, angleRad) {
+    const dx = rx - rotW / 2;
+    const dy = ry - rotH / 2;
+    const c = Math.cos(angleRad);
+    const s = Math.sin(angleRad);
+    return {
+      x: srcW / 2 + dx * c + dy * s,
+      y: srcH / 2 - dx * s + dy * c,
+    };
+  }
+
+  function mapBoxToOriginal(bbox, srcW, srcH, rotW, rotH, angleRad) {
+    const corners = [
+      [bbox.x0, bbox.y0],
+      [bbox.x1, bbox.y0],
+      [bbox.x1, bbox.y1],
+      [bbox.x0, bbox.y1],
+    ].map(([x, y]) => rotatedToOrig(x, y, srcW, srcH, rotW, rotH, angleRad));
+    const p0 = corners[0];
+    const p1 = corners[1];
+    const p3 = corners[3];
+    const width = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    const height = Math.hypot(p3.x - p0.x, p3.y - p0.y);
+    const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+    const cy = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+    const cssAngle = (Math.atan2(p1.y - p0.y, p1.x - p0.x) * 180) / Math.PI;
+    return { quad: corners, width, height, cx, cy, cssAngle };
+  }
+
+  function wordArea(item) {
+    return Math.max(1, (item.width || 0) * (item.height || 0));
+  }
+
+  async function recognizeFrame() {
+    await commonReady;
+    const srcW = frame.width;
+    const srcH = frame.height;
+    loadingText.textContent = "Finding orientation…";
+    const lineAngle = findLineAngle(frame);
+    loadingText.textContent = "Checking orientation…";
+    const { angle } = await chooseReadingAngle(frame, lineAngle);
+    const normalized = ((angle % 360) + 360) % 360;
+    const needsRotate = Math.min(normalized, 360 - normalized) >= 0.5;
+    const ocrCanvas = needsRotate ? rotateCanvas(frame, angle) : frame;
+    const worker = await getWorker();
+    const { data } = await worker.recognize(ocrCanvas);
+    const rotW = ocrCanvas.width;
+    const rotH = ocrCanvas.height;
+    const angleRad = (angle * Math.PI) / 180;
     const words = (data.words || [])
       .filter((w) => isKeepableToken(w.text, w.confidence ?? 0))
-      .map((w) => ({
-        text: w.text,
-        word: normalizeWord(w.text),
-        confidence: w.confidence,
-        bbox: w.bbox,
-      }));
+      .map((w) => {
+        const mapped = mapBoxToOriginal(w.bbox, srcW, srcH, rotW, rotH, angleRad);
+        const word = normalizeWord(w.text);
+        return {
+          text: w.text,
+          word,
+          confidence: w.confidence,
+          common: isFilteredOut(word),
+          bbox: w.bbox,
+          quad: mapped.quad,
+          width: mapped.width,
+          height: mapped.height,
+          cx: mapped.cx,
+          cy: mapped.cy,
+          angle: mapped.cssAngle,
+        };
+      });
+    lastWords = words;
+    lastOrientation = { angle, lineAngle, srcW, srcH, rotW, rotH };
     return words;
   }
 
@@ -254,21 +581,20 @@
   }
 
   function renderBoxes(words) {
+    const visible = visibleWords(words);
     boxesEl.innerHTML = "";
-    const sorted = words.slice().sort((a, b) => {
-      const areaA = (a.bbox.x1 - a.bbox.x0) * (a.bbox.y1 - a.bbox.y0);
-      const areaB = (b.bbox.x1 - b.bbox.x0) * (b.bbox.y1 - b.bbox.y0);
-      return areaB - areaA;
-    });
+    const sorted = visible.slice().sort((a, b) => wordArea(b) - wordArea(a));
     for (const item of sorted) {
-      const { x0, y0, x1, y1 } = item.bbox;
       const el = document.createElement("button");
       el.type = "button";
       el.className = "word-box";
-      el.style.left = `${(x0 / frame.width) * 100}%`;
-      el.style.top = `${(y0 / frame.height) * 100}%`;
-      el.style.width = `${((x1 - x0) / frame.width) * 100}%`;
-      el.style.height = `${((y1 - y0) / frame.height) * 100}%`;
+      el.style.left = `${((item.cx - item.width / 2) / frame.width) * 100}%`;
+      el.style.top = `${((item.cy - item.height / 2) / frame.height) * 100}%`;
+      el.style.width = `${(item.width / frame.width) * 100}%`;
+      el.style.height = `${(item.height / frame.height) * 100}%`;
+      if (Math.abs(item.angle) >= 0.4) {
+        el.style.transform = `rotate(${item.angle}deg)`;
+      }
       el.setAttribute("aria-label", `Define ${item.word}`);
       el.addEventListener("click", (ev) => {
         ev.preventDefault();
@@ -279,6 +605,7 @@
     }
     show(boxesEl);
     syncOverlay();
+    return visible;
   }
 
   function selectWord(el, item) {
@@ -414,14 +741,15 @@
     hide(tapHint);
     hide(boxesEl);
     boxesEl.innerHTML = "";
+    lastWords = [];
     setMode("frozen");
     hide(shutter);
     show(retake);
+    hide(toggleCommon);
     show(controls);
     hide(startEl);
 
-    let lastStatus = "Preparing reader…";
-    setLoading(true, lastStatus);
+    setLoading(true, "Preparing reader…");
     progressHandler = (m) => {
       if (!m) return;
       if (m.status === "recognizing text" && typeof m.progress === "number") {
@@ -440,9 +768,14 @@
     try {
       const words = await recognizeFrame();
       setLoading(false);
-      renderBoxes(words);
+      updateToggleLabel();
+      show(toggleCommon);
+      const visible = renderBoxes(words);
       if (!words.length) {
         showToast("No clear words found. Try sharper text and retake.");
+        hide(tapHint);
+      } else if (!visible.length) {
+        showToast("Common words are hidden. Tap Show all if you need one.");
         hide(tapHint);
       } else {
         show(tapHint);
@@ -452,7 +785,6 @@
       console.error(err);
       setLoading(false);
       showToast("Couldn’t read the text. Try a clearer shot.");
-      show(tapHint);
       hide(tapHint);
       throw err;
     } finally {
@@ -484,6 +816,7 @@
     boxesEl.innerHTML = "";
     hide(tapHint);
     hide(toastEl);
+    hide(toggleCommon);
     if (!stream) {
       hide(controls);
       show(startEl);
@@ -526,6 +859,7 @@
   $("choose-photo").addEventListener("click", onChoosePhoto);
   shutter.addEventListener("click", onShutter);
   retake.addEventListener("click", onRetake);
+  toggleCommon.addEventListener("click", () => setShowAll(!showAll));
   fileInput.addEventListener("change", onFileChange);
   $("sheet-close").addEventListener("click", () => closeSheet());
   sheetBackdrop.addEventListener("click", () => closeSheet());
@@ -553,9 +887,13 @@
     openLiveCamera();
   }
 
+  updateToggleLabel();
+
   window.__wordLensTest = {
     normalizeWord,
     isKeepableToken,
+    isCommonWord,
+    isFilteredOut,
     async recognizeImageBlob(blob) {
       const file = blob instanceof File ? blob : new File([blob], "sample.png", { type: blob.type || "image/png" });
       await loadImageFile(file);
@@ -566,6 +904,31 @@
     },
     async openWord(word) {
       openSheet(normalizeWord(word));
+    },
+    setShowAll,
+    getShowAll() {
+      return showAll;
+    },
+    getState() {
+      const words = lastWords.map((w) => ({
+        word: w.word,
+        confidence: w.confidence,
+        common: w.common,
+        cx: w.cx,
+        cy: w.cy,
+        width: w.width,
+        height: w.height,
+        angle: w.angle,
+        quad: w.quad,
+      }));
+      return {
+        words,
+        visible: visibleWords(lastWords).map((w) => w.word),
+        showAll,
+        orientation: lastOrientation,
+        frame: { width: frame.width, height: frame.height },
+        commonCount: commonWords.size,
+      };
     },
   };
 })();
