@@ -547,6 +547,12 @@
     });
   }
 
+  // After permission has been granted, skip the start screen when possible.
+  // iPhone Safari still needs a tap the first time.
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    openLiveCamera();
+  }
+
   window.__wordLensTest = {
     normalizeWord,
     isKeepableToken,

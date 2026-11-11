@@ -2,6 +2,10 @@
 
 A tiny iPhone-friendly PWA: point the camera at a page, freeze the frame, tap a word, and read its definition.
 
+## Live app
+
+[https://echogitshadow.github.io/word-lens/](https://echogitshadow.github.io/word-lens/)
+
 ## How to use
 
 1. Open the site in Safari on your iPhone (HTTPS required for the camera).
