@@ -1,14 +1,21 @@
 (() => {
-  const CONFIDENCE_MIN = 55;
+  const CONFIDENCE_LONG = 40;
+  const CONFIDENCE_SHORT = 48;
   const SHORT_WORD_MAX = 2;
   const DICTIONARY_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/";
+  const WIKTIONARY_URL = "https://en.wiktionary.org/api/rest_v1/page/definition/";
   const TESSERACT_VERSION = "5.1.1";
   const TESSERACT_CORE = "5.1.1";
   const ANALYZE_MAX = 400;
   const FLIP_MAX = 480;
   const FLIP_CONF_OK = 70;
   const FLIP_WORDS_OK = 4;
+  const OCR_MIN_SIDE = 2000;
+  const OCR_MAX_SIDE = 2200;
+  const DISPLAY_MAX_SIDE = 2500;
   const SHOW_ALL_KEY = "word-lens-show-all";
+  const CACHE_KEY = "word-lens-def-cache-v1";
+  const CACHE_LIMIT = 80;
 
   const $ = (id) => document.getElementById(id);
 
@@ -24,6 +31,7 @@
   const retake = $("retake");
   const toggleCommon = $("toggle-common");
   const tapHint = $("tap-hint");
+  const steadyHint = $("steady-hint");
   const toastEl = $("toast");
   const sheet = $("sheet");
   const sheetBackdrop = $("sheet-backdrop");
@@ -31,6 +39,7 @@
   const sheetPhonetic = $("sheet-phonetic");
   const sheetBody = $("sheet-body");
   const fileInput = $("file");
+  const focusReticle = $("focus-reticle");
 
   let stream = null;
   let busy = false;
@@ -43,11 +52,22 @@
   let lastOrientation = { angle: 0 };
   let showAll = false;
   let quietOcr = false;
+  let reticleTimer = null;
+  const lookupCache = new Map();
 
   try {
     showAll = localStorage.getItem(SHOW_ALL_KEY) === "1";
   } catch (err) {
     showAll = false;
+  }
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(CACHE_KEY) || "[]");
+    if (Array.isArray(stored)) {
+      for (const [key, value] of stored) lookupCache.set(key, value);
+    }
+  } catch (err) {
+    // ignore bad cache
   }
 
   const commonReady = fetch("./common-words.json")
@@ -69,23 +89,25 @@
   preview.playsInline = true;
 
   function show(el) {
-    el.hidden = false;
+    if (el) el.hidden = false;
   }
 
   function hide(el) {
-    el.hidden = true;
+    if (el) el.hidden = true;
   }
 
   function setMode(mode) {
     document.body.classList.remove("live", "frozen");
     if (mode) document.body.classList.add(mode);
+    if (mode === "live") show(steadyHint);
+    else hide(steadyHint);
   }
 
-  function showToast(message) {
+  function showToast(message, ms) {
     toastEl.textContent = message;
     show(toastEl);
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => hide(toastEl), 4000);
+    toastTimer = setTimeout(() => hide(toastEl), ms || 4500);
   }
 
   function setLoading(on, message) {
@@ -108,6 +130,25 @@
     };
   }
 
+  async function tightenCameraTrack(mediaStream) {
+    const track = mediaStream.getVideoTracks()[0];
+    if (!track || !track.applyConstraints) return;
+    try {
+      const caps = typeof track.getCapabilities === "function" ? track.getCapabilities() : {};
+      const next = {
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      };
+      if (caps.width && caps.width.max) next.width.ideal = Math.min(caps.width.max, 1920);
+      if (caps.height && caps.height.max) next.height.ideal = Math.min(caps.height.max, 1080);
+      if (caps.focusMode && caps.focusMode.includes("continuous")) next.focusMode = "continuous";
+      else if (caps.focusMode && caps.focusMode.includes("single-shot")) next.focusMode = "single-shot";
+      await track.applyConstraints(next);
+    } catch (err) {
+      // Some browsers reject optional constraints; the initial stream is still usable.
+    }
+  }
+
   async function startCamera() {
     stopCamera();
     try {
@@ -122,8 +163,10 @@
         throw err;
       }
     }
+    await tightenCameraTrack(stream);
     preview.srcObject = stream;
     await preview.play();
+    await waitForVideoReady();
   }
 
   function stopCamera() {
@@ -132,6 +175,35 @@
       stream = null;
     }
     preview.srcObject = null;
+  }
+
+  function waitForEvent(el, name, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Camera is not ready yet.")), ms);
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      el.addEventListener(name, done, { once: true });
+    });
+  }
+
+  async function waitForVideoReady() {
+    if (!preview.videoWidth || !preview.videoHeight) {
+      try {
+        await waitForEvent(preview, "loadeddata", 4000);
+      } catch (err) {
+        if (!preview.videoWidth) throw err;
+      }
+    }
+    if (typeof preview.requestVideoFrameCallback === "function") {
+      await new Promise((resolve) => preview.requestVideoFrameCallback(() => resolve()));
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!preview.videoWidth || !preview.videoHeight) {
+      throw new Error("Camera is not ready yet.");
+    }
   }
 
   function cameraErrorMessage(err) {
@@ -172,14 +244,51 @@
     }
   }
 
-  function captureVideoFrame() {
+  function drawFrameFromVideo() {
     const w = preview.videoWidth;
     const h = preview.videoHeight;
     if (!w || !h) throw new Error("Camera is not ready yet.");
-    frame.width = w;
-    frame.height = h;
+    const scale = Math.min(1, DISPLAY_MAX_SIDE / Math.max(w, h));
+    const dw = Math.max(1, Math.round(w * scale));
+    const dh = Math.max(1, Math.round(h * scale));
+    frame.width = dw;
+    frame.height = dh;
     const ctx = frame.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(preview, 0, 0, w, h);
+    ctx.drawImage(preview, 0, 0, dw, dh);
+  }
+
+  function frameLooksEmpty() {
+    const w = frame.width;
+    const h = frame.height;
+    if (!w || !h) return true;
+    const ctx = frame.getContext("2d", { willReadFrequently: true });
+    const sample = 6;
+    const data = ctx.getImageData(0, 0, w, h).data;
+    let lum = 0;
+    let count = 0;
+    for (let y = 0; y < sample; y += 1) {
+      for (let x = 0; x < sample; x += 1) {
+        const px = Math.floor(((x + 0.5) / sample) * (w - 1));
+        const py = Math.floor(((y + 0.5) / sample) * (h - 1));
+        const i = (py * w + px) * 4;
+        lum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        count += 1;
+      }
+    }
+    return lum / count < 6;
+  }
+
+  async function captureVideoFrame() {
+    await waitForVideoReady();
+    drawFrameFromVideo();
+    for (let attempt = 0; attempt < 4 && frameLooksEmpty(); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      if (typeof preview.requestVideoFrameCallback === "function") {
+        await new Promise((resolve) => preview.requestVideoFrameCallback(() => resolve()));
+      }
+      drawFrameFromVideo();
+    }
+    if (frameLooksEmpty()) throw new Error("The camera frame was empty. Tap Retake and try again.");
   }
 
   function loadImageFile(file) {
@@ -187,7 +296,7 @@
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => {
-        const maxSide = 1920;
+        const maxSide = DISPLAY_MAX_SIDE;
         let w = img.naturalWidth;
         let h = img.naturalHeight;
         const scale = Math.min(1, maxSide / Math.max(w, h));
@@ -210,20 +319,22 @@
 
   function normalizeWord(text) {
     return String(text || "")
-      .replace(/[^A-Za-z'’-]/g, "")
-      .replace(/^[’'-]+|[’'-]+$/g, "")
-      .replace(/’/g, "'")
+      .replace(/[\u2018\u2019\u201B\u2032]/g, "'")
+      .replace(/[\u201C\u201D\u00AB\u00BB]/g, "")
+      .replace(/[\u2010-\u2015\u2212\u00AD]/g, "-")
+      .replace(/[^A-Za-z'-]/g, "")
+      .replace(/^[ '-]+|[ '-]+$/g, "")
       .toLowerCase();
   }
 
   function isKeepableToken(raw, confidence) {
-    if (confidence < CONFIDENCE_MIN) return false;
     const word = normalizeWord(raw);
     if (!word) return false;
-    if (!/[a-z]/.test(word)) return false;
     if (!/^[a-z]+(?:['-][a-z]+)*$/.test(word)) return false;
-    if (word.length === 1 && word !== "a" && word !== "i") return false;
-    return true;
+    const conf = confidence ?? 0;
+    if (word.length === 1) return (word === "a" || word === "i") && conf >= CONFIDENCE_LONG;
+    if (word.length <= 3) return conf >= CONFIDENCE_SHORT;
+    return conf >= CONFIDENCE_LONG;
   }
 
   function isCommonWord(word) {
@@ -257,23 +368,111 @@
     if (lastWords.length) renderBoxes(lastWords);
   }
 
-  function getWorker() {
+  function doubledConsonantStem(stem) {
+    if (stem.length < 3) return "";
+    const last = stem[stem.length - 1];
+    const prev = stem[stem.length - 2];
+    if (last === prev && /[bcdfghjklmnpqrstvwxyz]/.test(last)) return stem.slice(0, -1);
+    return "";
+  }
+
+  function lemmaCandidates(word) {
+    const base = normalizeWord(word);
+    const out = [];
+    const add = (w) => {
+      if (w && /^[a-z]+(?:['-][a-z]+)*$/.test(w) && !out.includes(w)) out.push(w);
+    };
+    add(base);
+    if (!base) return out;
+    if (base.endsWith("'s")) add(base.slice(0, -2));
+    if (base.endsWith("s'")) add(base.slice(0, -2) + "s");
+    if (base.includes("-")) add(base.replace(/-/g, ""));
+    if (base.endsWith("ies") && base.length > 4) add(base.slice(0, -3) + "y");
+    if (base.endsWith("ves") && base.length > 4) {
+      add(base.slice(0, -3) + "f");
+      add(base.slice(0, -3) + "fe");
+    }
+    if (base.endsWith("es") && base.length > 4) add(base.slice(0, -2));
+    if (base.endsWith("s") && !base.endsWith("ss") && base.length > 3) add(base.slice(0, -1));
+    if (base.endsWith("ing") && base.length > 5) {
+      const stem = base.slice(0, -3);
+      add(stem);
+      add(stem + "e");
+      add(doubledConsonantStem(stem));
+    }
+    if (base.endsWith("ed") && base.length > 4) {
+      const stem = base.slice(0, -2);
+      add(stem);
+      add(stem + "e");
+      add(doubledConsonantStem(stem));
+    }
+    if (base.endsWith("ily") && base.length > 5) add(base.slice(0, -3) + "y");
+    else if (base.endsWith("ly") && base.length > 4) add(base.slice(0, -2));
+    if (base.endsWith("est") && base.length > 5) {
+      const stem = base.slice(0, -3);
+      add(stem);
+      add(stem + "e");
+      add(doubledConsonantStem(stem));
+    } else if (base.endsWith("er") && base.length > 4) {
+      const stem = base.slice(0, -2);
+      add(stem);
+      add(stem + "e");
+      add(doubledConsonantStem(stem));
+    }
+    return out;
+  }
+
+  async function getWorker() {
     if (!workerPromise) {
-      const opts = {
-        logger: (m) => {
-          if (quietOcr) return;
-          if (typeof progressHandler === "function") progressHandler(m);
-        },
-        workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESSERACT_VERSION}/dist/worker.min.js`,
-        corePath: `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESSERACT_CORE}/tesseract-core-simd-lstm.wasm.js`,
-        langPath: "https://tessdata.projectnaptha.com/4.0.0",
-      };
-      workerPromise = Tesseract.createWorker("eng", 1, opts).catch((err) => {
+      workerPromise = createWorkerWithFallback().catch((err) => {
         workerPromise = null;
         throw err;
       });
     }
     return workerPromise;
+  }
+
+  async function createWorkerWithFallback() {
+    const cores = [
+      `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESSERACT_CORE}/tesseract-core-simd-lstm.wasm.js`,
+      `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESSERACT_CORE}/tesseract-core-lstm.wasm.js`,
+    ];
+    let lastErr;
+    for (const corePath of cores) {
+      try {
+        return await Tesseract.createWorker("eng", 1, {
+          logger: (m) => {
+            if (quietOcr) return;
+            if (typeof progressHandler === "function") progressHandler(m);
+          },
+          workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESSERACT_VERSION}/dist/worker.min.js`,
+          corePath,
+          langPath: "https://tessdata.projectnaptha.com/4.0.0",
+        });
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error("Couldn’t start the text reader.");
+  }
+
+  async function recognizeSafe(canvas, options) {
+    const tryOnce = async () => {
+      const worker = await getWorker();
+      return worker.recognize(canvas, options || {});
+    };
+    try {
+      return await tryOnce();
+    } catch (err) {
+      try {
+        const old = await workerPromise;
+        if (old && old.terminate) await old.terminate();
+      } catch (termErr) {
+        // ignore
+      }
+      workerPromise = null;
+      return tryOnce();
+    }
   }
 
   function makeScaledCanvas(source, maxSide) {
@@ -335,7 +534,302 @@
         thresh = t;
       }
     }
-    return thresh;
+    return { thresh, score: max };
+  }
+
+  function histogram(gray) {
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < gray.length; i += 1) hist[gray[i]] += 1;
+    return hist;
+  }
+
+  function percentileFromHist(hist, total, p) {
+    const target = Math.max(0, Math.min(total - 1, Math.floor(total * p)));
+    let seen = 0;
+    for (let i = 0; i < 256; i += 1) {
+      seen += hist[i];
+      if (seen > target) return i;
+    }
+    return 255;
+  }
+
+  function applyGrayWorld(data) {
+    let rSum = 0;
+    let gSum = 0;
+    let bSum = 0;
+    let count = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const y = r * 0.299 + g * 0.587 + b * 0.114;
+      if (y > 18 && y < 250) {
+        rSum += r;
+        gSum += g;
+        bSum += b;
+        count += 1;
+      }
+    }
+    if (count < 50) return;
+    const rMean = rSum / count;
+    const gMean = gSum / count;
+    const bMean = bSum / count;
+    const gray = (rMean + gMean + bMean) / 3;
+    const clampGain = (gain) => Math.max(0.45, Math.min(2.4, gain));
+    const rGain = clampGain(gray / Math.max(1, rMean));
+    const gGain = clampGain(gray / Math.max(1, gMean));
+    const bGain = clampGain(gray / Math.max(1, bMean));
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.max(0, Math.min(255, (data[i] * rGain) | 0));
+      data[i + 1] = Math.max(0, Math.min(255, (data[i + 1] * gGain) | 0));
+      data[i + 2] = Math.max(0, Math.min(255, (data[i + 2] * bGain) | 0));
+    }
+  }
+
+  function stretchChannel(values) {
+    const hist = histogram(values);
+    const p1 = percentileFromHist(hist, values.length, 0.001);
+    const p5 = percentileFromHist(hist, values.length, 0.02);
+    const p95 = percentileFromHist(hist, values.length, 0.98);
+    const p99 = percentileFromHist(hist, values.length, 0.999);
+    let lo = p5;
+    let hi = p95;
+    // Sparse text on a large page can be well under 2% of pixels, so p5/p95
+    // both sit on the paper color and a naive stretch would crush the page to black.
+    if (hi - lo < 40) {
+      lo = p1;
+      hi = Math.max(p99, lo + 16);
+    }
+    if (hi - lo < 24) return values.slice ? values.slice() : Uint8Array.from(values);
+    const span = hi - lo;
+    const out = new Uint8Array(values.length);
+    for (let i = 0; i < values.length; i += 1) {
+      const v = ((values[i] - lo) * 255) / span;
+      out[i] = v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    }
+    return out;
+  }
+
+  function claheGray(gray, width, height, tileSize, clipLimit) {
+    const tilesX = Math.max(2, Math.ceil(width / tileSize));
+    const tilesY = Math.max(2, Math.ceil(height / tileSize));
+    const tileW = width / tilesX;
+    const tileH = height / tilesY;
+    const maps = [];
+    for (let ty = 0; ty < tilesY; ty += 1) {
+      for (let tx = 0; tx < tilesX; tx += 1) {
+        const x0 = Math.floor(tx * tileW);
+        const y0 = Math.floor(ty * tileH);
+        const x1 = Math.min(width, Math.floor((tx + 1) * tileW));
+        const y1 = Math.min(height, Math.floor((ty + 1) * tileH));
+        const hist = new Float64Array(256);
+        let count = 0;
+        let sum = 0;
+        let sumSq = 0;
+        for (let y = y0; y < y1; y += 1) {
+          const row = y * width;
+          for (let x = x0; x < x1; x += 1) {
+            const v = gray[row + x];
+            hist[v] += 1;
+            sum += v;
+            sumSq += v * v;
+            count += 1;
+          }
+        }
+        const identity = new Uint8Array(256);
+        for (let i = 0; i < 256; i += 1) identity[i] = i;
+        const mean = count ? sum / count : 0;
+        const variance = count ? sumSq / count - mean * mean : 0;
+        // Flat paper tiles should not be equalized or they turn into noise.
+        if (count < 16 || variance < 40) {
+          maps.push(identity);
+          continue;
+        }
+        const clip = Math.max(1, (clipLimit * count) / 256);
+        let excess = 0;
+        for (let i = 0; i < 256; i += 1) {
+          if (hist[i] > clip) {
+            excess += hist[i] - clip;
+            hist[i] = clip;
+          }
+        }
+        const inc = excess / 256;
+        for (let i = 0; i < 256; i += 1) hist[i] += inc;
+        const cdf = new Uint8Array(256);
+        let acc = 0;
+        const scale = 255 / Math.max(1, count);
+        for (let i = 0; i < 256; i += 1) {
+          acc += hist[i];
+          cdf[i] = Math.max(0, Math.min(255, Math.round(acc * scale)));
+        }
+        maps.push(cdf);
+      }
+    }
+    const out = new Uint8Array(gray.length);
+    for (let y = 0; y < height; y += 1) {
+      const ty = (y + 0.5) / tileH - 0.5;
+      const ty0 = Math.max(0, Math.min(tilesY - 1, Math.floor(ty)));
+      const ty1 = Math.max(0, Math.min(tilesY - 1, ty0 + 1));
+      const fy = ty0 === ty1 ? 0 : ty - ty0;
+      for (let x = 0; x < width; x += 1) {
+        const tx = (x + 0.5) / tileW - 0.5;
+        const tx0 = Math.max(0, Math.min(tilesX - 1, Math.floor(tx)));
+        const tx1 = Math.max(0, Math.min(tilesX - 1, tx0 + 1));
+        const fx = tx0 === tx1 ? 0 : tx - tx0;
+        const v = gray[y * width + x];
+        const a = maps[ty0 * tilesX + tx0][v];
+        const b = maps[ty0 * tilesX + tx1][v];
+        const c = maps[ty1 * tilesX + tx0][v];
+        const d = maps[ty1 * tilesX + tx1][v];
+        const top = a * (1 - fx) + b * fx;
+        const bot = c * (1 - fx) + d * fx;
+        out[y * width + x] = (top * (1 - fy) + bot * fy) | 0;
+      }
+    }
+    return out;
+  }
+
+  function grayToCanvas(gray, width, height) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const img = ctx.createImageData(width, height);
+    const data = img.data;
+    for (let p = 0, i = 0; p < gray.length; p += 1, i += 4) {
+      const v = gray[p];
+      data[i] = v;
+      data[i + 1] = v;
+      data[i + 2] = v;
+      data[i + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  function preprocessForOcr(source) {
+    const w = source.width;
+    const h = source.height;
+    const ctx = source.getContext("2d", { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, w, h);
+    applyGrayWorld(img.data);
+    const n = w * h;
+    const chR = new Uint8Array(n);
+    const chG = new Uint8Array(n);
+    const chB = new Uint8Array(n);
+    const chL = new Uint8Array(n);
+    const chM = new Uint8Array(n);
+    const data = img.data;
+    for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      chR[p] = r;
+      chG[p] = g;
+      chB[p] = b;
+      chL[p] = (r * 299 + g * 587 + b * 114) / 1000;
+      chM[p] = r < g ? (r < b ? r : b) : g < b ? g : b;
+    }
+    let best = chL;
+    let bestScore = -1;
+    for (const channel of [chR, chG, chB, chL, chM]) {
+      const stretched = stretchChannel(channel);
+      const hist = histogram(stretched);
+      const score = otsuThreshold(hist, n).score;
+      if (score > bestScore) {
+        bestScore = score;
+        best = stretched;
+      }
+    }
+    const hist = histogram(best);
+    const p10 = percentileFromHist(hist, n, 0.1);
+    const p90 = percentileFromHist(hist, n, 0.9);
+    const median = percentileFromHist(hist, n, 0.5);
+    if (median < 100 && p90 < 150 && p10 < 40) {
+      // Dim dark-text photo: stretch already applied; do not invert.
+    } else if (median < 90 && p90 > 160) {
+      for (let i = 0; i < best.length; i += 1) best[i] = 255 - best[i];
+    }
+    const contrast = p90 - p10;
+    const enhanced = contrast >= 100 ? best : claheGray(best, w, h, 64, 2.0);
+    return grayToCanvas(enhanced, w, h);
+  }
+
+  function contentBounds(source) {
+    const w = source.width;
+    const h = source.height;
+    const ctx = source.getContext("2d", { willReadFrequently: true });
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const hist = new Uint32Array(256);
+    const gray = new Uint8Array(w * h);
+    for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+      const g = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+      const v = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+      gray[p] = v;
+      hist[v] += 1;
+    }
+    const thresh = Math.min(220, otsuThreshold(hist, w * h).thresh + 8);
+    let minX = w;
+    let minY = h;
+    let maxX = 0;
+    let maxY = 0;
+    for (let y = 0; y < h; y += 1) {
+      const row = y * w;
+      for (let x = 0; x < w; x += 1) {
+        if (gray[row + x] < thresh) {
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX <= minX || maxY <= minY) {
+      return { x: 0, y: 0, w, h };
+    }
+    const padX = Math.max(12, Math.round((maxX - minX) * 0.08));
+    const padY = Math.max(12, Math.round((maxY - minY) * 0.08));
+    const x = Math.max(0, minX - padX);
+    const y = Math.max(0, minY - padY);
+    return {
+      x,
+      y,
+      w: Math.min(w - x, maxX - minX + padX * 2),
+      h: Math.min(h - y, maxY - minY + padY * 2),
+    };
+  }
+
+  function prepareOcrSource(source) {
+    const bounds = contentBounds(source);
+    const contentArea = bounds.w * bounds.h;
+    const fullArea = source.width * source.height;
+    const cropped = contentArea < fullArea * 0.72;
+    const srcW = cropped ? bounds.w : source.width;
+    const srcH = cropped ? bounds.h : source.height;
+    const longSide = Math.max(srcW, srcH);
+    let scale = 1;
+    if (longSide < OCR_MIN_SIDE) scale = OCR_MIN_SIDE / longSide;
+    else if (longSide > OCR_MAX_SIDE) scale = OCR_MAX_SIDE / longSide;
+    const w = Math.max(1, Math.round(srcW * scale));
+    const h = Math.max(1, Math.round(srcH * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    if (cropped) {
+      ctx.drawImage(source, bounds.x, bounds.y, bounds.w, bounds.h, 0, 0, w, h);
+    } else {
+      ctx.drawImage(source, 0, 0, w, h);
+    }
+    return {
+      canvas,
+      scaleX: w / srcW,
+      scaleY: h / srcH,
+      offsetX: cropped ? bounds.x : 0,
+      offsetY: cropped ? bounds.y : 0,
+    };
   }
 
   function binarizeCanvas(source) {
@@ -346,12 +840,11 @@
     const gray = new Uint8Array(w * h);
     const hist = new Uint32Array(256);
     for (let i = 0, p = 0; i < img.data.length; i += 4, p += 1) {
-      const value = (img.data[i] * 299 + img.data[i + 1] * 587 + img.data[i + 2] * 114) / 1000;
-      const g = value < 0 ? 0 : value > 255 ? 255 : value | 0;
-      gray[p] = g;
-      hist[g] += 1;
+      const value = img.data[i];
+      gray[p] = value;
+      hist[value] += 1;
     }
-    const thresh = otsuThreshold(hist, w * h);
+    const thresh = otsuThreshold(hist, w * h).thresh;
     const out = document.createElement("canvas");
     out.width = w;
     out.height = h;
@@ -424,6 +917,9 @@
     scratch.getContext("2d", { willReadFrequently: true });
     let bestAngle = 0;
     let bestScore = -1;
+    const score0 = scoreSkewAngle(binary, 0, scratch);
+    bestScore = score0;
+    bestAngle = 0;
     for (let angle = -45; angle < 135; angle += 5) {
       const score = scoreSkewAngle(binary, angle, scratch);
       if (score > bestScore) {
@@ -434,7 +930,7 @@
     const start = bestAngle - 4;
     const end = bestAngle + 4;
     for (let angle = start; angle <= end; angle += 1) {
-      if (angle === bestAngle) continue;
+      if (angle === 0 || angle === bestAngle) continue;
       const score = scoreSkewAngle(binary, angle, scratch);
       if (score > bestScore) {
         bestScore = score;
@@ -442,6 +938,9 @@
       }
     }
     if (bestScore <= 0) return 0;
+    // Ignore uncertain skew so a straight page is not twisted.
+    if (Math.abs(bestAngle) <= 3) return 0;
+    if (Math.abs(bestAngle) < 50 && bestScore < score0 * 1.28) return 0;
     return bestAngle;
   }
 
@@ -450,18 +949,27 @@
     const avgConf = words.length
       ? words.reduce((sum, w) => sum + (w.confidence || 0), 0) / words.length
       : 0;
+    const longWords = words.filter((w) => normalizeWord(w.text).length >= 5).length;
     return {
       keepable: words.length,
+      longWords,
       avgConf,
-      total: words.length * 8 + avgConf,
+      total: words.length * 8 + longWords * 6 + avgConf,
     };
   }
 
+  function isWeakScore(score) {
+    if (!score) return true;
+    if (score.keepable < 4) return true;
+    if (score.longWords < 2 && score.keepable < 8) return true;
+    if (score.avgConf < 58 && score.keepable < 8) return true;
+    return false;
+  }
+
   async function scoreOcrCanvas(canvas) {
-    const worker = await getWorker();
     quietOcr = true;
     try {
-      const { data } = await worker.recognize(canvas);
+      const { data } = await recognizeSafe(canvas);
       return scoreOcrData(data);
     } finally {
       quietOcr = false;
@@ -492,13 +1000,19 @@
     };
   }
 
-  function mapBoxToOriginal(bbox, srcW, srcH, rotW, rotH, angleRad) {
+  function mapBoxToOriginal(bbox, srcW, srcH, rotW, rotH, angleRad, prepared) {
     const corners = [
       [bbox.x0, bbox.y0],
       [bbox.x1, bbox.y0],
       [bbox.x1, bbox.y1],
       [bbox.x0, bbox.y1],
-    ].map(([x, y]) => rotatedToOrig(x, y, srcW, srcH, rotW, rotH, angleRad));
+    ].map(([x, y]) => {
+      const p = rotatedToOrig(x, y, srcW, srcH, rotW, rotH, angleRad);
+      return {
+        x: p.x / prepared.scaleX + prepared.offsetX,
+        y: p.y / prepared.scaleY + prepared.offsetY,
+      };
+    });
     const p0 = corners[0];
     const p1 = corners[1];
     const p3 = corners[3];
@@ -514,26 +1028,39 @@
     return Math.max(1, (item.width || 0) * (item.height || 0));
   }
 
-  async function recognizeFrame() {
-    await commonReady;
-    const srcW = frame.width;
-    const srcH = frame.height;
-    loadingText.textContent = "Finding orientation…";
-    const lineAngle = findLineAngle(frame);
-    loadingText.textContent = "Checking orientation…";
-    const { angle } = await chooseReadingAngle(frame, lineAngle);
-    const normalized = ((angle % 360) + 360) % 360;
-    const needsRotate = Math.min(normalized, 360 - normalized) >= 0.5;
-    const ocrCanvas = needsRotate ? rotateCanvas(frame, angle) : frame;
-    const worker = await getWorker();
-    const { data } = await worker.recognize(ocrCanvas);
-    const rotW = ocrCanvas.width;
-    const rotH = ocrCanvas.height;
+  function mergeHyphenBreaks(rawWords) {
+    const sorted = rawWords.slice().sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0);
+    const out = [];
+    for (let i = 0; i < sorted.length; i += 1) {
+      const cur = sorted[i];
+      const text = String(cur.text || "");
+      const next = sorted[i + 1];
+      if (next && /[-\u00AD\u2010-\u2015]$/.test(text)) {
+        const joinedText = text.replace(/[-\u00AD\u2010-\u2015]\s*$/, "") + String(next.text || "");
+        out.push({
+          text: joinedText,
+          confidence: Math.min(cur.confidence ?? 0, next.confidence ?? 0),
+          bbox: {
+            x0: Math.min(cur.bbox.x0, next.bbox.x0),
+            y0: Math.min(cur.bbox.y0, next.bbox.y0),
+            x1: Math.max(cur.bbox.x1, next.bbox.x1),
+            y1: Math.max(cur.bbox.y1, next.bbox.y1),
+          },
+        });
+        i += 1;
+        continue;
+      }
+      out.push(cur);
+    }
+    return out;
+  }
+
+  function wordsFromData(data, srcW, srcH, rotW, rotH, angle, prepared) {
     const angleRad = (angle * Math.PI) / 180;
-    const words = (data.words || [])
+    return mergeHyphenBreaks(data.words || [])
       .filter((w) => isKeepableToken(w.text, w.confidence ?? 0))
       .map((w) => {
-        const mapped = mapBoxToOriginal(w.bbox, srcW, srcH, rotW, rotH, angleRad);
+        const mapped = mapBoxToOriginal(w.bbox, srcW, srcH, rotW, rotH, angleRad, prepared);
         const word = normalizeWord(w.text);
         return {
           text: w.text,
@@ -549,9 +1076,58 @@
           angle: mapped.cssAngle,
         };
       });
-    lastWords = words;
-    lastOrientation = { angle, lineAngle, srcW, srcH, rotW, rotH };
-    return words;
+  }
+
+  async function recognizeAt(processed, angle, psm, prepared) {
+    const normalized = ((angle % 360) + 360) % 360;
+    const needsRotate = Math.min(normalized, 360 - normalized) >= 0.5;
+    const ocrCanvas = needsRotate ? rotateCanvas(processed, angle) : processed;
+    const { data } = await recognizeSafe(ocrCanvas, { tessedit_pageseg_mode: String(psm) });
+    const score = scoreOcrData(data);
+    const words = wordsFromData(data, processed.width, processed.height, ocrCanvas.width, ocrCanvas.height, angle, prepared);
+    return { words, score, angle, psm, rotW: ocrCanvas.width, rotH: ocrCanvas.height };
+  }
+
+  async function recognizeFrame() {
+    await commonReady;
+    loadingText.textContent = "Enhancing photo…";
+    const prepared = prepareOcrSource(frame);
+    const processed = preprocessForOcr(prepared.canvas);
+    loadingText.textContent = "Finding orientation…";
+    const lineAngle = findLineAngle(processed);
+    loadingText.textContent = "Checking orientation…";
+    const chosen = await chooseReadingAngle(processed, lineAngle);
+    let best = await recognizeAt(processed, chosen.angle, 3, prepared);
+    const nearlyZero = Math.min(((chosen.angle % 360) + 360) % 360, 360 - (((chosen.angle % 360) + 360) % 360)) < 0.5;
+    if (isWeakScore(best.score) && !nearlyZero) {
+      loadingText.textContent = "Trying another read…";
+      const zero = await recognizeAt(processed, 0, 3, prepared);
+      if (zero.score.total >= best.score.total) best = zero;
+    }
+    if (isWeakScore(best.score)) {
+      loadingText.textContent = "Trying another read…";
+      const sparse = await recognizeAt(processed, 0, 11, prepared);
+      if (sparse.score.total >= best.score.total) best = sparse;
+    }
+    if (isWeakScore(best.score) && !nearlyZero) {
+      const sparseTilt = await recognizeAt(processed, chosen.angle, 11, prepared);
+      if (sparseTilt.score.total > best.score.total) best = sparseTilt;
+    }
+    if (isWeakScore(best.score)) {
+      const block = await recognizeAt(processed, best.angle, 6, prepared);
+      if (block.score.total >= best.score.total) best = block;
+    }
+    lastWords = best.words;
+    lastOrientation = {
+      angle: best.angle,
+      lineAngle,
+      psm: best.psm,
+      srcW: frame.width,
+      srcH: frame.height,
+      rotW: best.rotW,
+      rotH: best.rotH,
+    };
+    return best.words;
   }
 
   function containedRect() {
@@ -634,12 +1210,156 @@
   }
 
   function openSheet(word) {
-    sheetWord.textContent = word;
+    sheetWord.value = word;
     sheetPhonetic.textContent = "";
     sheetBody.innerHTML = `<p class="pending"><span class="spinner"></span>Looking up definition…</p>`;
     show(sheet);
     requestAnimationFrame(() => sheet.classList.add("open"));
     loadDefinition(word);
+  }
+
+  function persistCache() {
+    try {
+      localStorage.setItem(CACHE_KEY, JSON.stringify([...lookupCache].slice(-CACHE_LIMIT)));
+    } catch (err) {
+      // ignore quota
+    }
+  }
+
+  function cacheGet(word) {
+    return lookupCache.get(word) || null;
+  }
+
+  function cacheSet(word, payload) {
+    lookupCache.set(word, payload);
+    persistCache();
+  }
+
+  function stripHtml(html) {
+    const div = document.createElement("div");
+    div.innerHTML = String(html || "");
+    return (div.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function combineSignals(signal, ms) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    if (signal) {
+      if (signal.aborted) ctrl.abort();
+      else signal.addEventListener("abort", () => ctrl.abort(), { once: true });
+    }
+    return { signal: ctrl.signal, clear: () => clearTimeout(timer) };
+  }
+
+  async function fetchDictionaryApi(word, signal) {
+    const wait = combineSignals(signal, 5000);
+    try {
+      const res = await fetch(DICTIONARY_URL + encodeURIComponent(word), { signal: wait.signal });
+      if (res.status === 404) {
+        const err = new Error("not found");
+        err.code = "not_found";
+        throw err;
+      }
+      if (!res.ok) throw new Error(`Dictionary error ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data) || !data.length) {
+        const err = new Error("not found");
+        err.code = "not_found";
+        throw err;
+      }
+      data._source = "dictionary";
+      data._queried = word;
+      return data;
+    } finally {
+      wait.clear();
+    }
+  }
+
+  async function fetchWiktionary(word, signal) {
+    const wait = combineSignals(signal, 6000);
+    try {
+      const res = await fetch(WIKTIONARY_URL + encodeURIComponent(word), {
+        signal: wait.signal,
+        headers: { Accept: "application/json" },
+      });
+      if (res.status === 404) {
+        const err = new Error("not found");
+        err.code = "not_found";
+        throw err;
+      }
+      if (!res.ok) throw new Error(`Wiktionary error ${res.status}`);
+      const data = await res.json();
+      const entries = data && Array.isArray(data.en) ? data.en : [];
+      const meanings = [];
+      for (const entry of entries) {
+        const defs = (entry.definitions || [])
+          .map((d) => stripHtml(d.definition))
+          .filter((text) => text && text.length > 1)
+          .slice(0, 3);
+        if (!defs.length) continue;
+        meanings.push({
+          partOfSpeech: entry.partOfSpeech || "",
+          definitions: defs.map((definition) => ({ definition })),
+        });
+        if (meanings.length >= 3) break;
+      }
+      if (!meanings.length) {
+        const err = new Error("not found");
+        err.code = "not_found";
+        throw err;
+      }
+      const result = [{ word, phonetic: "", meanings }];
+      result._source = "wiktionary";
+      result._queried = word;
+      return result;
+    } finally {
+      wait.clear();
+    }
+  }
+
+  async function lookupOne(word, signal) {
+    const cached = cacheGet(word);
+    if (cached) return cached;
+    try {
+      const data = await fetchDictionaryApi(word, signal);
+      cacheSet(word, data);
+      return data;
+    } catch (err) {
+      if (err && err.name === "AbortError") throw err;
+      if (err && err.code === "not_found") {
+        try {
+          const data = await fetchWiktionary(word, signal);
+          cacheSet(word, data);
+          return data;
+        } catch (wikiErr) {
+          if (wikiErr && wikiErr.name === "AbortError") throw wikiErr;
+          throw err.code === "not_found" && wikiErr && wikiErr.code === "not_found" ? wikiErr : wikiErr || err;
+        }
+      }
+      // Network or 5xx: still try Wiktionary.
+      const data = await fetchWiktionary(word, signal);
+      cacheSet(word, data);
+      return data;
+    }
+  }
+
+  async function fetchDefinition(word, signal) {
+    const candidates = lemmaCandidates(word);
+    if (!candidates.length) {
+      const err = new Error("not found");
+      err.code = "not_found";
+      throw err;
+    }
+    let lastErr = null;
+    for (const candidate of candidates) {
+      try {
+        return await lookupOne(candidate, signal);
+      } catch (err) {
+        if (err && err.name === "AbortError") throw err;
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error("not found");
   }
 
   async function loadDefinition(word) {
@@ -655,28 +1375,11 @@
       if (lookupAbort !== ac) return;
       if (err && err.code === "not_found") {
         sheetPhonetic.textContent = "";
-        sheetBody.innerHTML = `<p class="empty">No definition found for “${escapeHtml(word)}.” It might be a name, a typo, or too uncommon for this dictionary.</p>`;
+        sheetBody.innerHTML = `<p class="empty">No definition found for “${escapeHtml(normalizeWord(word) || word)}.” You can edit the word above and try again.</p>`;
         return;
       }
-      sheetBody.innerHTML = `<p class="empty">Couldn’t reach the dictionary. Check your connection and try again.</p>`;
+      sheetBody.innerHTML = `<p class="empty">Couldn’t reach the dictionary. Check your connection and try again, or edit the word above.</p>`;
     }
-  }
-
-  async function fetchDefinition(word, signal) {
-    const res = await fetch(DICTIONARY_URL + encodeURIComponent(word), { signal });
-    if (res.status === 404) {
-      const err = new Error("not found");
-      err.code = "not_found";
-      throw err;
-    }
-    if (!res.ok) throw new Error(`Dictionary error ${res.status}`);
-    const data = await res.json();
-    if (!Array.isArray(data) || !data.length) {
-      const err = new Error("not found");
-      err.code = "not_found";
-      throw err;
-    }
-    return data;
   }
 
   function firstPhonetic(entries) {
@@ -691,10 +1394,7 @@
   }
 
   function renderDefinition(word, entries) {
-    const display = (entries[0] && entries[0].word) || word;
-    sheetWord.textContent = display.toLowerCase();
     sheetPhonetic.textContent = firstPhonetic(entries);
-
     const meanings = [];
     for (const entry of entries) {
       for (const meaning of entry.meanings || []) {
@@ -713,7 +1413,7 @@
     }
 
     if (!meanings.length) {
-      sheetBody.innerHTML = `<p class="empty">No definition found for “${escapeHtml(word)}.” It might be a name, a typo, or too uncommon for this dictionary.</p>`;
+      sheetBody.innerHTML = `<p class="empty">No definition found for “${escapeHtml(normalizeWord(word) || word)}.” You can edit the word above and try again.</p>`;
       return;
     }
 
@@ -734,6 +1434,15 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
       .replace(/"/g, "&quot;");
+  }
+
+  function searchEditedWord() {
+    const word = normalizeWord(sheetWord.value);
+    if (!word) return;
+    sheetWord.value = word;
+    sheetPhonetic.textContent = "";
+    sheetBody.innerHTML = `<p class="pending"><span class="spinner"></span>Looking up definition…</p>`;
+    loadDefinition(word);
   }
 
   async function runOcrFlow() {
@@ -772,10 +1481,10 @@
       show(toggleCommon);
       const visible = renderBoxes(words);
       if (!words.length) {
-        showToast("No clear words found. Try sharper text and retake.");
+        showToast("No text found, try moving closer, better light.");
         hide(tapHint);
       } else if (!visible.length) {
-        showToast("Common words are hidden. Tap Show all if you need one.");
+        showToast("Only common words found, tap Show all.");
         hide(tapHint);
       } else {
         show(tapHint);
@@ -784,7 +1493,7 @@
     } catch (err) {
       console.error(err);
       setLoading(false);
-      showToast("Couldn’t read the text. Try a clearer shot.");
+      showToast("Couldn’t read the text. Tap Retake to try again.");
       hide(tapHint);
       throw err;
     } finally {
@@ -800,10 +1509,14 @@
     }
     busy = true;
     try {
-      captureVideoFrame();
+      await captureVideoFrame();
       await runOcrFlow();
     } catch (err) {
       console.error(err);
+      if (!loadingEl.hidden) setLoading(false);
+      if (err && /empty|not ready/i.test(err.message || "")) {
+        showToast(err.message);
+      }
     } finally {
       busy = false;
     }
@@ -855,6 +1568,32 @@
     }
   }
 
+  async function onTapToFocus(ev) {
+    if (!document.body.classList.contains("live")) return;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (!track || !track.applyConstraints) return;
+    const rect = preview.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const x = (ev.clientX - rect.left) / rect.width;
+    const y = (ev.clientY - rect.top) / rect.height;
+    if (x < 0 || y < 0 || x > 1 || y > 1) return;
+    if (focusReticle) {
+      focusReticle.style.left = `${ev.clientX}px`;
+      focusReticle.style.top = `${ev.clientY}px`;
+      focusReticle.classList.add("show");
+      clearTimeout(reticleTimer);
+      reticleTimer = setTimeout(() => focusReticle.classList.remove("show"), 600);
+    }
+    try {
+      await track.applyConstraints({
+        advanced: [{ pointsOfInterest: [{ x, y }] }],
+      });
+    } catch (err) {
+      // iOS may ignore point-of-interest focus; tapping still gives a visual cue.
+    }
+  }
+
   $("open-camera").addEventListener("click", openLiveCamera);
   $("choose-photo").addEventListener("click", onChoosePhoto);
   shutter.addEventListener("click", onShutter);
@@ -863,6 +1602,14 @@
   fileInput.addEventListener("change", onFileChange);
   $("sheet-close").addEventListener("click", () => closeSheet());
   sheetBackdrop.addEventListener("click", () => closeSheet());
+  sheetWord.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      searchEditedWord();
+    }
+  });
+  sheetWord.addEventListener("change", searchEditedWord);
+  $("stage").addEventListener("click", onTapToFocus);
   window.addEventListener("resize", syncOverlay);
   window.addEventListener("orientationchange", () => setTimeout(syncOverlay, 250));
 
@@ -894,13 +1641,14 @@
     isKeepableToken,
     isCommonWord,
     isFilteredOut,
+    lemmaCandidates,
     async recognizeImageBlob(blob) {
       const file = blob instanceof File ? blob : new File([blob], "sample.png", { type: blob.type || "image/png" });
       await loadImageFile(file);
       return runOcrFlow();
     },
     async lookup(word) {
-      return fetchDefinition(normalizeWord(word));
+      return fetchDefinition(word);
     },
     async openWord(word) {
       openSheet(normalizeWord(word));

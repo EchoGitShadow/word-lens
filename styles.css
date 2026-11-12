@@ -128,6 +128,7 @@ body.frozen #frame {
 #sheet[hidden],
 #toast[hidden],
 #tap-hint[hidden],
+#steady-hint[hidden],
 #boxes[hidden],
 #retake[hidden],
 #shutter[hidden],
@@ -300,7 +301,8 @@ button {
   font-weight: 500;
 }
 
-#tap-hint {
+#tap-hint,
+#steady-hint {
   position: absolute;
   top: calc(14px + var(--safe-t));
   left: 50%;
@@ -315,6 +317,29 @@ button {
   letter-spacing: 0.01em;
   z-index: 14;
   pointer-events: none;
+}
+
+#focus-reticle {
+  position: fixed;
+  width: 72px;
+  height: 72px;
+  margin: -36px 0 0 -36px;
+  border: 2px solid rgba(232, 197, 114, 0.95);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 18;
+  opacity: 0;
+  transform: scale(0.7);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+#focus-reticle.show {
+  opacity: 1;
+  transform: scale(1);
+}
+
+#focus-reticle[hidden] {
+  display: none !important;
 }
 
 #toast {
@@ -388,12 +413,31 @@ button {
 }
 
 #sheet-word {
-  margin: 18px 28px 4px 0;
+  display: block;
+  width: calc(100% - 28px);
+  margin: 18px 28px 0 0;
+  padding: 0 0 4px;
+  border: 0;
+  border-bottom: 1px solid rgba(244, 241, 234, 0.18);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
   font-size: 2rem;
   font-weight: 700;
   letter-spacing: -0.03em;
   line-height: 1.1;
   text-transform: lowercase;
+}
+
+#sheet-word:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+
+#sheet-edit-hint {
+  margin: 4px 28px 10px 0;
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 #sheet-phonetic {
