@@ -1,0 +1,6 @@
+Word Lens offline definitions are a compact extract of:
+
+- WordNet 3.0, Princeton University. Use of WordNet is subject to
+  the license in WORDNET-LICENSE.txt.
+- Webster's Revised Unabridged Dictionary (1913), which is in the
+  public domain. Used only for words that WordNet does not include.

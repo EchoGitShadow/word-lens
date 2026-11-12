@@ -21,7 +21,7 @@ To install it as an app: in Safari, tap Share → Add to Home Screen.
 
 - The camera uses the rear lens when it can (`facingMode: environment`).
 - OCR runs entirely in the browser with Tesseract.js (English).
-- Definitions come from [Free Dictionary API](https://dictionaryapi.dev/), with a Wiktionary fallback if that request fails.
+- Definitions come first from a bundled offline extract of [WordNet 3.0](https://wordnet.princeton.edu/) and Webster's 1913 dictionary, then from Wiktionary, Datamuse, or the [Free Dictionary API](https://dictionaryapi.dev/) if needed. If the app looks up a base form such as *languid* for *languidly*, it says “from languid.”
 - Low-confidence and non-alphabetic tokens are ignored.
 - Photos with warm, cool, or dim lighting are color-corrected before OCR. Tight glare over a word can still hide it.
 - Sideways, upside-down, and moderately skewed photos are straightened for reading; boxes are mapped back onto the original photo.

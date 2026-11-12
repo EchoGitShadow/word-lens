@@ -1,0 +1,112 @@
+{
+  "wordnet_words": 69279,
+  "webster_added": 10852,
+  "total_words": 80131,
+  "letters": {
+    "a": {
+      "words": 5853,
+      "bytes": 563810
+    },
+    "b": {
+      "words": 4297,
+      "bytes": 425911
+    },
+    "c": {
+      "words": 7265,
+      "bytes": 745562
+    },
+    "d": {
+      "words": 4628,
+      "bytes": 439240
+    },
+    "e": {
+      "words": 3252,
+      "bytes": 326183
+    },
+    "f": {
+      "words": 3295,
+      "bytes": 322899
+    },
+    "g": {
+      "words": 2397,
+      "bytes": 239062
+    },
+    "h": {
+      "words": 3115,
+      "bytes": 317504
+    },
+    "i": {
+      "words": 4017,
+      "bytes": 365284
+    },
+    "j": {
+      "words": 623,
+      "bytes": 67618
+    },
+    "k": {
+      "words": 709,
+      "bytes": 76807
+    },
+    "l": {
+      "words": 2785,
+      "bytes": 274088
+    },
+    "m": {
+      "words": 4377,
+      "bytes": 443603
+    },
+    "n": {
+      "words": 2079,
+      "bytes": 195407
+    },
+    "o": {
+      "words": 2025,
+      "bytes": 189096
+    },
+    "p": {
+      "words": 6290,
+      "bytes": 637147
+    },
+    "q": {
+      "words": 391,
+      "bytes": 39236
+    },
+    "r": {
+      "words": 3686,
+      "bytes": 370072
+    },
+    "s": {
+      "words": 8670,
+      "bytes": 852783
+    },
+    "t": {
+      "words": 3935,
+      "bytes": 395098
+    },
+    "u": {
+      "words": 2832,
+      "bytes": 216024
+    },
+    "v": {
+      "words": 1281,
+      "bytes": 127375
+    },
+    "w": {
+      "words": 1800,
+      "bytes": 173525
+    },
+    "x": {
+      "words": 113,
+      "bytes": 11281
+    },
+    "y": {
+      "words": 241,
+      "bytes": 25418
+    },
+    "z": {
+      "words": 175,
+      "bytes": 18880
+    }
+  },
+  "total_bytes": 7858913
+}

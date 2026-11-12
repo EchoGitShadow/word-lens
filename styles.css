@@ -452,6 +452,12 @@ button {
   display: none;
 }
 
+.from-lemma {
+  margin: -6px 0 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .pos {
   display: inline-block;
   margin: 6px 0 10px;

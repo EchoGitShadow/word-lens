@@ -4,6 +4,9 @@
   const SHORT_WORD_MAX = 2;
   const DICTIONARY_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/";
   const WIKTIONARY_URL = "https://en.wiktionary.org/api/rest_v1/page/definition/";
+  const DATAMUSE_URL = "https://api.datamuse.com/words?sp=";
+  const DICT_DIR = "./dict/";
+  const POS_LABEL = { n: "noun", v: "verb", a: "adjective", r: "adverb", adj: "adjective", adv: "adverb" };
   const TESSERACT_VERSION = "5.1.1";
   const TESSERACT_CORE = "5.1.1";
   const ANALYZE_MAX = 400;
@@ -14,7 +17,7 @@
   const OCR_MAX_SIDE = 2200;
   const DISPLAY_MAX_SIDE = 2500;
   const SHOW_ALL_KEY = "word-lens-show-all";
-  const CACHE_KEY = "word-lens-def-cache-v1";
+  const CACHE_KEY = "word-lens-def-cache-v2";
   const CACHE_LIMIT = 80;
 
   const $ = (id) => document.getElementById(id);
@@ -54,6 +57,7 @@
   let quietOcr = false;
   let reticleTimer = null;
   const lookupCache = new Map();
+  const letterCache = new Map();
 
   try {
     showAll = localStorage.getItem(SHOW_ALL_KEY) === "1";
@@ -419,6 +423,17 @@
       add(stem + "e");
       add(doubledConsonantStem(stem));
     }
+    if (base.endsWith("iness") && base.length > 6) add(base.slice(0, -5) + "y");
+    else if (base.endsWith("ness") && base.length > 5) add(base.slice(0, -4));
+    if (base.endsWith("isms") && base.length > 6) add(base.slice(0, -1));
+    if (base.endsWith("ism") && base.length > 5) add(base.slice(0, -3));
+    if (base.endsWith("ities") && base.length > 6) add(base.slice(0, -3) + "y");
+    else if (base.endsWith("ity") && base.length > 5) add(base.slice(0, -3));
+    if (base.endsWith("ment") && base.length > 6) add(base.slice(0, -4));
+    if (base.endsWith("ship") && base.length > 6) add(base.slice(0, -4));
+    if (base.endsWith("hood") && base.length > 6) add(base.slice(0, -4));
+    if (base.endsWith("ance") && base.length > 6) add(base.slice(0, -4));
+    if (base.endsWith("ence") && base.length > 6) add(base.slice(0, -4));
     return out;
   }
 
@@ -1235,10 +1250,27 @@
     persistCache();
   }
 
+  function notFoundError() {
+    const err = new Error("not found");
+    err.code = "not_found";
+    return err;
+  }
+
+  function isUserAbort(err, signal) {
+    return Boolean(err && err.name === "AbortError" && signal && signal.aborted);
+  }
+
+  function cleanDefinitionText(text) {
+    return String(text || "")
+      .replace(/\.mw-parser-output[\s\S]*$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function stripHtml(html) {
     const div = document.createElement("div");
     div.innerHTML = String(html || "");
-    return (div.textContent || "").replace(/\s+/g, " ").trim();
+    return cleanDefinitionText(div.textContent || "");
   }
 
   function combineSignals(signal, ms) {
@@ -1251,22 +1283,57 @@
     return { signal: ctrl.signal, clear: () => clearTimeout(timer) };
   }
 
+  function tagEntries(entries, original, queried, source) {
+    entries._source = source || entries._source || "";
+    entries._queried = queried;
+    entries._from = queried && queried !== original ? queried : "";
+    return entries;
+  }
+
+  async function loadLetterDict(letter) {
+    if (!letter) return {};
+    if (letterCache.has(letter)) return letterCache.get(letter);
+    const pending = fetch(DICT_DIR + encodeURIComponent(letter) + ".json")
+      .then((res) => (res.ok ? res.json() : {}))
+      .catch(() => ({}));
+    letterCache.set(letter, pending);
+    const data = await pending;
+    letterCache.set(letter, data);
+    return data;
+  }
+
+  function localToEntries(word, rec) {
+    if (!rec || !rec.length) return null;
+    const meanings = [];
+    for (const item of rec) {
+      const pos = POS_LABEL[item[0]] || item[0] || "";
+      const definition = cleanDefinitionText(item[1]);
+      if (!definition) continue;
+      const existing = meanings.find((m) => m.partOfSpeech === pos);
+      if (existing) {
+        if (existing.definitions.length < 3) existing.definitions.push({ definition });
+      } else {
+        meanings.push({ partOfSpeech: pos, definitions: [{ definition }] });
+      }
+    }
+    if (!meanings.length) return null;
+    return [{ word, phonetic: "", meanings }];
+  }
+
+  async function lookupLocal(word) {
+    if (!word) return null;
+    const data = await loadLetterDict(word[0]);
+    return localToEntries(word, data[word]);
+  }
+
   async function fetchDictionaryApi(word, signal) {
-    const wait = combineSignals(signal, 5000);
+    const wait = combineSignals(signal, 6000);
     try {
       const res = await fetch(DICTIONARY_URL + encodeURIComponent(word), { signal: wait.signal });
-      if (res.status === 404) {
-        const err = new Error("not found");
-        err.code = "not_found";
-        throw err;
-      }
+      if (res.status === 404) throw notFoundError();
       if (!res.ok) throw new Error(`Dictionary error ${res.status}`);
       const data = await res.json();
-      if (!Array.isArray(data) || !data.length) {
-        const err = new Error("not found");
-        err.code = "not_found";
-        throw err;
-      }
+      if (!Array.isArray(data) || !data.length) throw notFoundError();
       data._source = "dictionary";
       data._queried = word;
       return data;
@@ -1278,15 +1345,8 @@
   async function fetchWiktionary(word, signal) {
     const wait = combineSignals(signal, 6000);
     try {
-      const res = await fetch(WIKTIONARY_URL + encodeURIComponent(word), {
-        signal: wait.signal,
-        headers: { Accept: "application/json" },
-      });
-      if (res.status === 404) {
-        const err = new Error("not found");
-        err.code = "not_found";
-        throw err;
-      }
+      const res = await fetch(WIKTIONARY_URL + encodeURIComponent(word), { signal: wait.signal });
+      if (res.status === 404) throw notFoundError();
       if (!res.ok) throw new Error(`Wiktionary error ${res.status}`);
       const data = await res.json();
       const entries = data && Array.isArray(data.en) ? data.en : [];
@@ -1294,7 +1354,7 @@
       for (const entry of entries) {
         const defs = (entry.definitions || [])
           .map((d) => stripHtml(d.definition))
-          .filter((text) => text && text.length > 1)
+          .filter((text) => text && text.length > 1 && !text.startsWith(".mw-parser-output"))
           .slice(0, 3);
         if (!defs.length) continue;
         meanings.push({
@@ -1303,11 +1363,7 @@
         });
         if (meanings.length >= 3) break;
       }
-      if (!meanings.length) {
-        const err = new Error("not found");
-        err.code = "not_found";
-        throw err;
-      }
+      if (!meanings.length) throw notFoundError();
       const result = [{ word, phonetic: "", meanings }];
       result._source = "wiktionary";
       result._queried = word;
@@ -1317,49 +1373,87 @@
     }
   }
 
-  async function lookupOne(word, signal) {
-    const cached = cacheGet(word);
-    if (cached) return cached;
+  async function fetchDatamuse(word, signal) {
+    const wait = combineSignals(signal, 6000);
     try {
-      const data = await fetchDictionaryApi(word, signal);
-      cacheSet(word, data);
-      return data;
-    } catch (err) {
-      if (err && err.name === "AbortError") throw err;
-      if (err && err.code === "not_found") {
-        try {
-          const data = await fetchWiktionary(word, signal);
-          cacheSet(word, data);
-          return data;
-        } catch (wikiErr) {
-          if (wikiErr && wikiErr.name === "AbortError") throw wikiErr;
-          throw err.code === "not_found" && wikiErr && wikiErr.code === "not_found" ? wikiErr : wikiErr || err;
+      const url = DATAMUSE_URL + encodeURIComponent(word) + "&md=d&max=8";
+      const res = await fetch(url, { signal: wait.signal });
+      if (!res.ok) throw new Error(`Datamuse error ${res.status}`);
+      const data = await res.json();
+      const hit = Array.isArray(data)
+        ? data.find((item) => item && item.word === word && Array.isArray(item.defs) && item.defs.length)
+        : null;
+      if (!hit) throw notFoundError();
+      const meanings = [];
+      for (const raw of hit.defs) {
+        const split = String(raw).split("\t");
+        const code = (split[0] || "").trim();
+        const definition = cleanDefinitionText(split.slice(1).join("\t") || raw);
+        if (!definition) continue;
+        const pos = POS_LABEL[code] || code;
+        const existing = meanings.find((m) => m.partOfSpeech === pos);
+        if (existing) {
+          if (existing.definitions.length < 3) existing.definitions.push({ definition });
+        } else {
+          meanings.push({ partOfSpeech: pos, definitions: [{ definition }] });
         }
+        if (meanings.length >= 3) break;
       }
-      // Network or 5xx: still try Wiktionary.
-      const data = await fetchWiktionary(word, signal);
-      cacheSet(word, data);
-      return data;
+      if (!meanings.length) throw notFoundError();
+      const result = [{ word, phonetic: "", meanings }];
+      result._source = "datamuse";
+      result._queried = word;
+      return result;
+    } finally {
+      wait.clear();
     }
   }
 
-  async function fetchDefinition(word, signal) {
-    const candidates = lemmaCandidates(word);
-    if (!candidates.length) {
-      const err = new Error("not found");
-      err.code = "not_found";
-      throw err;
+  async function lookupApis(word, signal) {
+    const tasks = [fetchWiktionary(word, signal), fetchDatamuse(word, signal), fetchDictionaryApi(word, signal)];
+    const settled = await Promise.all(
+      tasks.map((promise) =>
+        promise.then((value) => ({ value }), (err) => {
+          if (isUserAbort(err, signal)) throw err;
+          return { err };
+        })
+      )
+    );
+    for (const item of settled) {
+      if (item && item.value) return item.value;
     }
+    throw notFoundError();
+  }
+
+  async function fetchDefinition(word, signal) {
+    const original = normalizeWord(word);
+    const cached = cacheGet(original);
+    if (cached) return cached;
+    const candidates = lemmaCandidates(original);
+    if (!candidates.length) throw notFoundError();
+
+    for (const candidate of candidates) {
+      const local = await lookupLocal(candidate);
+      if (local) {
+        tagEntries(local, original, candidate, "offline");
+        cacheSet(original, local);
+        return local;
+      }
+    }
+
     let lastErr = null;
     for (const candidate of candidates) {
       try {
-        return await lookupOne(candidate, signal);
+        const data = await lookupApis(candidate, signal);
+        tagEntries(data, original, candidate, data._source);
+        cacheSet(original, data);
+        return data;
       } catch (err) {
-        if (err && err.name === "AbortError") throw err;
+        if (isUserAbort(err, signal)) throw err;
         lastErr = err;
       }
     }
-    throw lastErr || new Error("not found");
+    throw lastErr || notFoundError();
   }
 
   async function loadDefinition(word) {
@@ -1417,7 +1511,12 @@
       return;
     }
 
-    sheetBody.innerHTML = meanings
+    const fromWord = entries._from;
+    const fromLine = fromWord
+      ? `<p class="from-lemma">from ${escapeHtml(fromWord)}</p>`
+      : "";
+
+    sheetBody.innerHTML = fromLine + meanings
       .map(
         (m) => `
         <section class="meaning">

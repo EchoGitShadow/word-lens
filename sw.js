@@ -1,4 +1,4 @@
-const CACHE = "word-lens-v4";
+const CACHE = "word-lens-v5";
 const SHELL = [
   "./",
   "./index.html",
