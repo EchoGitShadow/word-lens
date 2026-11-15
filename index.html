@@ -58,7 +58,14 @@
       <div id="sheet-panel" role="dialog" aria-modal="true" aria-labelledby="sheet-word">
         <div class="sheet-handle" aria-hidden="true"></div>
         <button id="sheet-close" type="button" aria-label="Close definition">Close</button>
-        <input id="sheet-word" type="text" enterkeyhint="search" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="Word to look up">
+        <div id="sheet-head">
+          <input id="sheet-word" type="text" enterkeyhint="search" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="Word to look up">
+          <button id="sheet-speak" type="button" aria-label="Play pronunciation">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+            </svg>
+          </button>
+        </div>
         <p id="sheet-edit-hint">Tap the word to edit if it looks wrong</p>
         <p id="sheet-phonetic"></p>
         <div id="sheet-body"></div>

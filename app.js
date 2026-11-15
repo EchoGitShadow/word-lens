@@ -19,6 +19,10 @@
   const SHOW_ALL_KEY = "word-lens-show-all";
   const CACHE_KEY = "word-lens-def-cache-v2";
   const CACHE_LIMIT = 80;
+  const TARGET_CAP_HEIGHT = 30;
+  const CAP_HEIGHT_MAX = 60;
+  const PRONUNCIATION_MS = 4000;
+  const WIKTIONARY_API = "https://en.wiktionary.org/w/api.php";
 
   const $ = (id) => document.getElementById(id);
 
@@ -40,6 +44,7 @@
   const sheetBackdrop = $("sheet-backdrop");
   const sheetWord = $("sheet-word");
   const sheetPhonetic = $("sheet-phonetic");
+  const sheetSpeak = $("sheet-speak");
   const sheetBody = $("sheet-body");
   const fileInput = $("file");
   const focusReticle = $("focus-reticle");
@@ -58,6 +63,8 @@
   let reticleTimer = null;
   const lookupCache = new Map();
   const letterCache = new Map();
+  let pronunciation = { word: "", audioUrl: "", phonetic: "", abort: null, preloaded: null };
+  let speakPlayer = null;
 
   try {
     showAll = localStorage.getItem(SHOW_ALL_KEY) === "1";
@@ -248,9 +255,9 @@
     }
   }
 
-  function drawFrameFromVideo() {
-    const w = preview.videoWidth;
-    const h = preview.videoHeight;
+  function drawBitmapToFrame(image) {
+    const w = image.videoWidth || image.naturalWidth || image.width;
+    const h = image.videoHeight || image.naturalHeight || image.height;
     if (!w || !h) throw new Error("Camera is not ready yet.");
     const scale = Math.min(1, DISPLAY_MAX_SIDE / Math.max(w, h));
     const dw = Math.max(1, Math.round(w * scale));
@@ -258,7 +265,38 @@
     frame.width = dw;
     frame.height = dh;
     const ctx = frame.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(preview, 0, 0, dw, dh);
+    ctx.drawImage(image, 0, 0, dw, dh);
+  }
+
+  function drawFrameFromVideo() {
+    drawBitmapToFrame(preview);
+  }
+
+  async function captureStillFromTrack(track) {
+    if (!track || typeof ImageCapture !== "function") return false;
+    try {
+      const ic = new ImageCapture(track);
+      if (typeof ic.takePhoto === "function") {
+        try {
+          const blob = await ic.takePhoto();
+          const bitmap = await createImageBitmap(blob);
+          drawBitmapToFrame(bitmap);
+          if (typeof bitmap.close === "function") bitmap.close();
+          if (!frameLooksEmpty()) return true;
+        } catch (err) {
+          // takePhoto is often blocked while the live preview owns the track.
+        }
+      }
+      if (typeof ic.grabFrame === "function") {
+        const bitmap = await ic.grabFrame();
+        drawBitmapToFrame(bitmap);
+        if (typeof bitmap.close === "function") bitmap.close();
+        return !frameLooksEmpty();
+      }
+    } catch (err) {
+      // Safari and many iPhones do not support ImageCapture.
+    }
+    return false;
   }
 
   function frameLooksEmpty() {
@@ -284,6 +322,8 @@
 
   async function captureVideoFrame() {
     await waitForVideoReady();
+    const track = stream && stream.getVideoTracks()[0];
+    if (await captureStillFromTrack(track)) return;
     drawFrameFromVideo();
     for (let attempt = 0; attempt < 4 && frameLooksEmpty(); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 80));
@@ -369,6 +409,10 @@
       // ignore quota / private mode
     }
     updateToggleLabel();
+
+  if (window.speechSynthesis && typeof window.speechSynthesis.getVoices === "function") {
+    window.speechSynthesis.getVoices();
+  }
     if (lastWords.length) renderBoxes(lastWords);
   }
 
@@ -847,6 +891,158 @@
     };
   }
 
+  function unsharpCanvas(source, amount) {
+    const strength = amount == null ? 0.4 : amount;
+    if (strength <= 0) return source;
+    const w = source.width;
+    const h = source.height;
+    const ctx = source.getContext("2d", { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, w, h);
+    const srcData = img.data;
+    const blur = new Uint8Array(w * h);
+    for (let y = 0; y < h; y += 1) {
+      const y0 = y > 0 ? y - 1 : y;
+      const y1 = y + 1 < h ? y + 1 : y;
+      for (let x = 0; x < w; x += 1) {
+        const x0 = x > 0 ? x - 1 : x;
+        const x1 = x + 1 < w ? x + 1 : x;
+        let sum = 0;
+        let n = 0;
+        for (let yy = y0; yy <= y1; yy += 1) {
+          for (let xx = x0; xx <= x1; xx += 1) {
+            sum += srcData[(yy * w + xx) * 4];
+            n += 1;
+          }
+        }
+        blur[y * w + x] = (sum / n) | 0;
+      }
+    }
+    for (let px = 0, i = 0; px < blur.length; px += 1, i += 4) {
+      const v = srcData[i] + strength * (srcData[i] - blur[px]);
+      const c = v < 0 ? 0 : v > 255 ? 255 : v | 0;
+      srcData[i] = c;
+      srcData[i + 1] = c;
+      srcData[i + 2] = c;
+    }
+    ctx.putImageData(img, 0, 0);
+    return source;
+  }
+
+  function medianOdd(values) {
+    if (!values.length) return 0;
+    const sorted = values.slice().sort((a, b) => a - b);
+    return sorted[sorted.length >> 1];
+  }
+
+  function estimateTextMetrics(source) {
+    const maxSide = 1000;
+    const inv = Math.min(1, maxSide / Math.max(source.width, source.height));
+    const w = Math.max(1, Math.round(source.width * inv));
+    const h = Math.max(1, Math.round(source.height * inv));
+    const tmp = document.createElement("canvas");
+    tmp.width = w;
+    tmp.height = h;
+    const ctx = tmp.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(source, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+    const gray = new Uint8Array(w * h);
+    const hist = new Uint32Array(256);
+    for (let i = 0, px = 0; i < data.length; i += 4, px += 1) {
+      const v = data[i];
+      gray[px] = v;
+      hist[v] += 1;
+    }
+    const thresh = otsuThreshold(hist, w * h).thresh;
+    const inkA = new Uint8Array(w * h);
+    const inkB = new Uint8Array(w * h);
+    let nA = 0;
+    let nB = 0;
+    for (let px = 0; px < gray.length; px += 1) {
+      if (gray[px] < thresh) {
+        inkA[px] = 1;
+        nA += 1;
+      } else {
+        inkB[px] = 1;
+        nB += 1;
+      }
+    }
+    const total = w * h;
+    const fracA = nA / total;
+    const fracB = nB / total;
+    const preferA = Math.abs(fracA - 0.06) <= Math.abs(fracB - 0.06) ? fracA < 0.45 : fracA < fracB;
+    const ink = preferA ? inkA : inkB;
+    const inkFrac = preferA ? fracA : fracB;
+
+    const row = new Float64Array(h);
+    for (let y = 0; y < h; y += 1) {
+      let sum = 0;
+      const off = y * w;
+      for (let x = 0; x < w; x += 1) sum += ink[off + x];
+      row[y] = sum;
+    }
+    const nonzero = [];
+    for (let y = 0; y < h; y += 1) if (row[y] > 0) nonzero.push(row[y]);
+    const cut = Math.max(2, (nonzero.length ? medianOdd(nonzero) : 0) * 0.18);
+
+    const runs = [];
+    let inRun = false;
+    let start = 0;
+    for (let y = 0; y < h; y += 1) {
+      if (row[y] >= cut && !inRun) {
+        inRun = true;
+        start = y;
+      } else if (row[y] < cut && inRun) {
+        inRun = false;
+        runs.push(y - start);
+      }
+    }
+    if (inRun) runs.push(h - start);
+    let lineHeights = runs.filter((v) => v >= 6 && v <= h * 0.4);
+    if (lineHeights.length >= 2) {
+      const med = medianOdd(lineHeights);
+      lineHeights = lineHeights.filter((v) => v >= med * 0.55);
+    }
+
+    if (!lineHeights.length) return { capHeight: 0, lineCount: 0, inkFrac };
+    return { capHeight: medianOdd(lineHeights) / inv, lineCount: lineHeights.length, inkFrac };
+  }
+
+  function withPreparedScale(prepared, factor) {
+    if (!factor || Math.abs(factor - 1) < 0.02) return prepared;
+    const w = Math.max(1, Math.round(prepared.canvas.width * factor));
+    const h = Math.max(1, Math.round(prepared.canvas.height * factor));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(prepared.canvas, 0, 0, w, h);
+    return {
+      canvas,
+      scaleX: prepared.scaleX * (w / prepared.canvas.width),
+      scaleY: prepared.scaleY * (h / prepared.canvas.height),
+      offsetX: prepared.offsetX,
+      offsetY: prepared.offsetY,
+    };
+  }
+
+  function scaleFactorsForCap(prepared, capHeight) {
+    const factors = [1];
+    if (!capHeight || capHeight <= CAP_HEIGHT_MAX) return factors;
+    const longSide = Math.max(prepared.canvas.width, prepared.canvas.height);
+    let factor = TARGET_CAP_HEIGHT / capHeight;
+    if (longSide * factor < 480) factor = 480 / longSide;
+    if (capHeight * factor > 45) {
+      factor = TARGET_CAP_HEIGHT / capHeight;
+      if (longSide * factor < 320) factor = 320 / longSide;
+    }
+    if (factor > 0.98) return factors;
+    if (factor < 0.12) factor = 0.12;
+    factors.unshift(Math.round(factor * 1000) / 1000);
+    return factors;
+  }
+
   function binarizeCanvas(source) {
     const w = source.width;
     const h = source.height;
@@ -1106,31 +1302,65 @@
   async function recognizeFrame() {
     await commonReady;
     loadingText.textContent = "Enhancing photo…";
-    const prepared = prepareOcrSource(frame);
-    const processed = preprocessForOcr(prepared.canvas);
+    const base = prepareOcrSource(frame);
+    const metrics = estimateTextMetrics(base.canvas);
+    const factors = scaleFactorsForCap(base, metrics.capHeight);
+    const closeUp = metrics.capHeight > CAP_HEIGHT_MAX;
+    const prepared = withPreparedScale(base, factors[0]);
+    const processed = unsharpCanvas(preprocessForOcr(prepared.canvas));
     loadingText.textContent = "Finding orientation…";
     const lineAngle = findLineAngle(processed);
     loadingText.textContent = "Checking orientation…";
     const chosen = await chooseReadingAngle(processed, lineAngle);
-    let best = await recognizeAt(processed, chosen.angle, 3, prepared);
+    const firstPsm = closeUp ? 6 : 3;
+    let best = await recognizeAt(processed, chosen.angle, firstPsm, prepared);
+    best.scale = factors[0];
     const nearlyZero = Math.min(((chosen.angle % 360) + 360) % 360, 360 - (((chosen.angle % 360) + 360) % 360)) < 0.5;
     if (isWeakScore(best.score) && !nearlyZero) {
       loadingText.textContent = "Trying another read…";
-      const zero = await recognizeAt(processed, 0, 3, prepared);
-      if (zero.score.total >= best.score.total) best = zero;
+      const zero = await recognizeAt(processed, 0, firstPsm, prepared);
+      if (zero.score.total >= best.score.total) {
+        best = zero;
+        best.scale = factors[0];
+      }
     }
     if (isWeakScore(best.score)) {
       loadingText.textContent = "Trying another read…";
       const sparse = await recognizeAt(processed, 0, 11, prepared);
-      if (sparse.score.total >= best.score.total) best = sparse;
+      if (sparse.score.total >= best.score.total) {
+        best = sparse;
+        best.scale = factors[0];
+      }
     }
     if (isWeakScore(best.score) && !nearlyZero) {
       const sparseTilt = await recognizeAt(processed, chosen.angle, 11, prepared);
-      if (sparseTilt.score.total > best.score.total) best = sparseTilt;
+      if (sparseTilt.score.total > best.score.total) {
+        best = sparseTilt;
+        best.scale = factors[0];
+      }
     }
     if (isWeakScore(best.score)) {
-      const block = await recognizeAt(processed, best.angle, 6, prepared);
-      if (block.score.total >= best.score.total) best = block;
+      const nextPsm = firstPsm === 6 ? 3 : 6;
+      const block = await recognizeAt(processed, best.angle, nextPsm, prepared);
+      if (block.score.total >= best.score.total) {
+        best = block;
+        best.scale = factors[0];
+      }
+    }
+    if (isWeakScore(best.score) && factors.length > 1) {
+      loadingText.textContent = "Trying another scale…";
+      for (const factor of factors.slice(1)) {
+        const prep = withPreparedScale(base, factor);
+        const proc = unsharpCanvas(preprocessForOcr(prep.canvas));
+        const psms = closeUp ? [6, 11, 3] : [3, 11, 6];
+        for (const psm of psms) {
+          const attempt = await recognizeAt(proc, chosen.angle, psm, prep);
+          attempt.scale = factor;
+          if (attempt.score.total > best.score.total) best = attempt;
+          if (!isWeakScore(best.score)) break;
+        }
+        if (!isWeakScore(best.score)) break;
+      }
     }
     lastWords = best.words;
     lastOrientation = {
@@ -1141,6 +1371,8 @@
       srcH: frame.height,
       rotW: best.rotW,
       rotH: best.rotH,
+      capHeight: Math.round(metrics.capHeight || 0),
+      scale: best.scale || factors[0],
     };
     return best.words;
   }
@@ -1208,6 +1440,11 @@
   }
 
   function closeSheet(immediate) {
+    stopPronunciation();
+    if (pronunciation.abort) {
+      pronunciation.abort.abort();
+      pronunciation.abort = null;
+    }
     if (lookupAbort) {
       lookupAbort.abort();
       lookupAbort = null;
@@ -1225,11 +1462,13 @@
   }
 
   function openSheet(word) {
+    stopPronunciation();
     sheetWord.value = word;
     sheetPhonetic.textContent = "";
     sheetBody.innerHTML = `<p class="pending"><span class="spinner"></span>Looking up definition…</p>`;
     show(sheet);
     requestAnimationFrame(() => sheet.classList.add("open"));
+    startPronunciationPrefetch(word);
     loadDefinition(word);
   }
 
@@ -1468,12 +1707,287 @@
       if (err && err.name === "AbortError") return;
       if (lookupAbort !== ac) return;
       if (err && err.code === "not_found") {
-        sheetPhonetic.textContent = "";
+        if (!sheetPhonetic.textContent) sheetPhonetic.textContent = pronunciation.phonetic || "";
         sheetBody.innerHTML = `<p class="empty">No definition found for “${escapeHtml(normalizeWord(word) || word)}.” You can edit the word above and try again.</p>`;
         return;
       }
       sheetBody.innerHTML = `<p class="empty">Couldn’t reach the dictionary. Check your connection and try again, or edit the word above.</p>`;
     }
+  }
+
+  function currentSheetWord() {
+    return normalizeWord(sheetWord.value);
+  }
+
+  function stopPronunciation() {
+    try {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+    } catch (err) {
+      // ignore
+    }
+    if (speakPlayer) {
+      try {
+        speakPlayer.pause();
+        speakPlayer.removeAttribute("src");
+        speakPlayer.load();
+      } catch (err) {
+        // ignore
+      }
+      speakPlayer = null;
+    }
+    if (sheetSpeak) sheetSpeak.classList.remove("playing");
+  }
+
+  function canPlayUrl(url) {
+    if (!url) return false;
+    const probe = speakPlayer || pronunciation.preloaded || new Audio();
+    const lower = String(url).toLowerCase();
+    if (/\.ogg|\.oga(\?|$)/.test(lower)) {
+      const can = probe.canPlayType('audio/ogg; codecs="vorbis"') || probe.canPlayType("audio/ogg");
+      return can === "probably" || can === "maybe";
+    }
+    if (/\.opus(\?|$)/.test(lower)) {
+      const can = probe.canPlayType("audio/opus") || probe.canPlayType('audio/ogg; codecs="opus"');
+      return can === "probably" || can === "maybe";
+    }
+    return true;
+  }
+
+  function scoreAudioUrl(url) {
+    if (!url || !canPlayUrl(url)) return -100;
+    const u = String(url).toLowerCase();
+    let score = 1;
+    if (/\.mp3(\?|$)/.test(u) || /\.m4a(\?|$)/.test(u) || /\.wav(\?|$)/.test(u) || /\.aac(\?|$)/.test(u)) score += 4;
+    if (/\.ogg|\.oga|\.opus/.test(u)) score += 1;
+    if (/-us\b|_us_|en-us|en_us/.test(u)) score += 2;
+    else if (/-uk\b|-gb\b|en-uk|en-gb/.test(u)) score += 1;
+    return score;
+  }
+
+  function pickPhoneticAndAudio(entries) {
+    const result = { phonetic: firstPhonetic(entries || []), audioUrl: "" };
+    const urls = [];
+    for (const entry of entries || []) {
+      for (const item of entry.phonetics || []) {
+        if (!item) continue;
+        if (!result.phonetic && item.text) result.phonetic = item.text;
+        if (item.audio) urls.push(item.audio);
+      }
+    }
+    urls.sort((a, b) => scoreAudioUrl(b) - scoreAudioUrl(a));
+    result.audioUrl = urls.find((url) => scoreAudioUrl(url) > 0) || "";
+    return result;
+  }
+
+  function pickEnVoice() {
+    if (!window.speechSynthesis) return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    const en = voices.filter((v) => /^en(-|_|$)/i.test(v.lang) || /english/i.test(v.name));
+    const us = en.filter((v) => /en-US/i.test(v.lang) || /United States|Samantha|Google US/i.test(v.name));
+    return us[0] || en[0] || null;
+  }
+
+  function speakWithSynthesis(word) {
+    if (!window.speechSynthesis || !word) return false;
+    try {
+      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+    } catch (err) {
+      // ignore
+    }
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(word);
+    utter.lang = "en-US";
+    utter.rate = 0.88;
+    utter.pitch = 1;
+    const voice = pickEnVoice();
+    if (voice) utter.voice = voice;
+    utter.onstart = () => {
+      if (sheetSpeak) sheetSpeak.classList.add("playing");
+    };
+    const done = () => {
+      if (sheetSpeak) sheetSpeak.classList.remove("playing");
+    };
+    utter.onend = done;
+    utter.onerror = done;
+    window.speechSynthesis.speak(utter);
+    return true;
+  }
+
+  function playRecordedAudio(url, fallbackWord) {
+    stopPronunciation();
+    const audio = new Audio();
+    speakPlayer = audio;
+    audio.preload = "auto";
+    const fail = () => {
+      if (speakPlayer === audio) {
+        speakPlayer = null;
+        speakWithSynthesis(fallbackWord);
+      }
+    };
+    audio.onended = () => {
+      if (speakPlayer === audio) {
+        speakPlayer = null;
+        if (sheetSpeak) sheetSpeak.classList.remove("playing");
+      }
+    };
+    audio.onerror = fail;
+    audio.onplaying = () => {
+      if (sheetSpeak) sheetSpeak.classList.add("playing");
+    };
+    audio.src = url;
+    const play = audio.play();
+    if (play && typeof play.then === "function") play.catch(fail);
+  }
+
+  function preloadAudio(url) {
+    if (!url) return;
+    try {
+      const audio = new Audio();
+      audio.preload = "auto";
+      audio.src = url;
+      pronunciation.preloaded = audio;
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  function applyPronunciationInfo(word, info) {
+    if (!info || pronunciation.word !== word) return;
+    if (info.audioUrl && canPlayUrl(info.audioUrl)) {
+      if (!pronunciation.audioUrl || scoreAudioUrl(info.audioUrl) > scoreAudioUrl(pronunciation.audioUrl)) {
+        pronunciation.audioUrl = info.audioUrl;
+        preloadAudio(pronunciation.audioUrl);
+      }
+    }
+    if (info.phonetic) {
+      pronunciation.phonetic = pronunciation.phonetic || info.phonetic;
+      if (sheetPhonetic && !sheetPhonetic.textContent) sheetPhonetic.textContent = info.phonetic;
+    }
+  }
+
+  function isPronunciationFile(title, word) {
+    const name = String(title || "").replace(/^File:/i, "");
+    if (!/\.(ogg|oga|mp3|wav|opus|m4a)$/i.test(name)) return false;
+    if (/logo|icon|book|flag|image|\.svg/i.test(name)) return false;
+    const stem = word.replace(/'/g, "").toLowerCase();
+    const lower = name.toLowerCase();
+    if (lower.includes(stem)) return true;
+    return /^(en[-_ ]?(us|uk|gb|au)[-_ ])/i.test(name);
+  }
+
+  async function fetchWiktionaryAudio(word, signal) {
+    const wait = combineSignals(signal, PRONUNCIATION_MS);
+    try {
+      const listUrl =
+        WIKTIONARY_API +
+        "?action=query&format=json&origin=*&prop=images&redirects=1&imlimit=40&titles=" +
+        encodeURIComponent(word);
+      const res = await fetch(listUrl, { signal: wait.signal });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const pages = (data && data.query && data.query.pages) || {};
+      const titles = [];
+      for (const page of Object.values(pages)) {
+        for (const img of page.images || []) {
+          if (isPronunciationFile(img.title, word)) titles.push(img.title);
+        }
+      }
+      if (!titles.length) return null;
+      titles.sort((a, b) => scoreAudioUrl(b) - scoreAudioUrl(a));
+      const infoUrl =
+        WIKTIONARY_API +
+        "?action=query&format=json&origin=*&prop=imageinfo&iiprop=url&titles=" +
+        titles.slice(0, 6).map(encodeURIComponent).join("|");
+      const infoRes = await fetch(infoUrl, { signal: wait.signal });
+      if (!infoRes.ok) return null;
+      const infoData = await infoRes.json();
+      const infoPages = (infoData && infoData.query && infoData.query.pages) || {};
+      const urls = [];
+      for (const page of Object.values(infoPages)) {
+        const url = page.imageinfo && page.imageinfo[0] && page.imageinfo[0].url;
+        if (url) urls.push(url);
+      }
+      urls.sort((a, b) => scoreAudioUrl(b) - scoreAudioUrl(a));
+      const audioUrl = urls.find((url) => scoreAudioUrl(url) > 0) || "";
+      return audioUrl ? { phonetic: "", audioUrl } : null;
+    } catch (err) {
+      if (isUserAbort(err, signal)) throw err;
+      return null;
+    } finally {
+      wait.clear();
+    }
+  }
+
+  async function fetchDictionaryPronunciation(word, signal) {
+    const wait = combineSignals(signal, PRONUNCIATION_MS);
+    try {
+      const res = await fetch(DICTIONARY_URL + encodeURIComponent(word), { signal: wait.signal });
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (!Array.isArray(data) || !data.length) return null;
+      return pickPhoneticAndAudio(data);
+    } catch (err) {
+      if (isUserAbort(err, signal)) throw err;
+      return null;
+    } finally {
+      wait.clear();
+    }
+  }
+
+  async function fetchPronunciation(word, signal) {
+    const tasks = [fetchDictionaryPronunciation(word, signal), fetchWiktionaryAudio(word, signal)];
+    const settled = await Promise.all(
+      tasks.map((promise) =>
+        promise.then(
+          (value) => value,
+          (err) => {
+            if (isUserAbort(err, signal)) throw err;
+            return null;
+          }
+        )
+      )
+    );
+    const info = { phonetic: "", audioUrl: "" };
+    for (const item of settled) {
+      if (!item) continue;
+      if (item.phonetic && !info.phonetic) info.phonetic = item.phonetic;
+      if (item.audioUrl && scoreAudioUrl(item.audioUrl) > scoreAudioUrl(info.audioUrl)) {
+        info.audioUrl = item.audioUrl;
+      }
+    }
+    return info;
+  }
+
+  function startPronunciationPrefetch(word) {
+    const normalized = normalizeWord(word);
+    if (pronunciation.abort) {
+      pronunciation.abort.abort();
+      pronunciation.abort = null;
+    }
+    pronunciation = { word: normalized, audioUrl: "", phonetic: "", abort: null, preloaded: null };
+    if (!normalized) return;
+    const ac = new AbortController();
+    pronunciation.abort = ac;
+    fetchPronunciation(normalized, ac.signal)
+      .then((info) => applyPronunciationInfo(normalized, info))
+      .catch((err) => {
+        if (err && err.name === "AbortError") return;
+      });
+  }
+
+  function onSpeakClick() {
+    const word = currentSheetWord();
+    if (!word) return;
+    if (pronunciation.word !== word) {
+      startPronunciationPrefetch(word);
+      speakWithSynthesis(word);
+      return;
+    }
+    if (pronunciation.audioUrl && canPlayUrl(pronunciation.audioUrl)) {
+      playRecordedAudio(pronunciation.audioUrl, word);
+      return;
+    }
+    speakWithSynthesis(word);
   }
 
   function firstPhonetic(entries) {
@@ -1488,7 +2002,10 @@
   }
 
   function renderDefinition(word, entries) {
-    sheetPhonetic.textContent = firstPhonetic(entries);
+    const info = pickPhoneticAndAudio(entries);
+    const spoken = normalizeWord(word);
+    sheetPhonetic.textContent = info.phonetic || pronunciation.phonetic || "";
+    if (spoken === pronunciation.word) applyPronunciationInfo(spoken, info);
     const meanings = [];
     for (const entry of entries) {
       for (const meaning of entry.meanings || []) {
@@ -1538,9 +2055,11 @@
   function searchEditedWord() {
     const word = normalizeWord(sheetWord.value);
     if (!word) return;
+    stopPronunciation();
     sheetWord.value = word;
     sheetPhonetic.textContent = "";
     sheetBody.innerHTML = `<p class="pending"><span class="spinner"></span>Looking up definition…</p>`;
+    startPronunciationPrefetch(word);
     loadDefinition(word);
   }
 
@@ -1700,6 +2219,7 @@
   toggleCommon.addEventListener("click", () => setShowAll(!showAll));
   fileInput.addEventListener("change", onFileChange);
   $("sheet-close").addEventListener("click", () => closeSheet());
+  sheetSpeak.addEventListener("click", onSpeakClick);
   sheetBackdrop.addEventListener("click", () => closeSheet());
   sheetWord.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {

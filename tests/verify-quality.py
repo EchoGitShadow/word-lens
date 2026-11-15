@@ -43,6 +43,9 @@ def main() -> int:
         ("dim-warm", HARD / "dim-warm.png", INTERESTING),
         ("book-page", HARD / "book-page.png", INTERESTING + BOOK_EXTRA),
         ("book-warm-2700k", HARD / "book-warm-2700k.png", INTERESTING + BOOK_EXTRA),
+        ("close-up", HARD / "close-up.png", ["serendipity", "language", "lucid", "definition", "understand"]),
+        ("close-up-blur", HARD / "close-up-blur.png", ["serendipity", "language", "lucid", "definition", "understand"]),
+        ("close-up-book", HARD / "close-up-book.png", INTERESTING + ["language", "definition", "understand", "difficult"]),
     ]
 
     report = {"label": args.label, "url": args.url, "images": [], "lookups": [], "ok": False}
