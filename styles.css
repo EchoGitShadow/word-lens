@@ -282,6 +282,142 @@ button {
   border-color: rgba(232, 197, 114, 0.5);
 }
 
+#mode-toggle {
+  grid-column: 1;
+  justify-self: start;
+  margin-left: 8px;
+  display: flex;
+  padding: 3px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+#mode-toggle button {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 999px;
+  color: rgba(244, 241, 234, 0.75);
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+#mode-toggle button[aria-pressed="true"] {
+  background: rgba(232, 197, 114, 0.28);
+  color: var(--ink);
+}
+
+#mode-toggle[hidden] {
+  display: none;
+}
+
+body.frozen #mode-toggle,
+body.frozen #distance-hint {
+  display: none;
+}
+
+#distance-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(92px + var(--safe-b));
+  margin: 0;
+  text-align: center;
+  color: rgba(244, 241, 234, 0.72);
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  z-index: 14;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6);
+}
+
+#distance-hint[hidden] {
+  display: none;
+}
+
+#live-reticle {
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  z-index: 13;
+  pointer-events: none;
+}
+
+#live-reticle::before,
+#live-reticle::after {
+  content: "";
+  position: absolute;
+  background: rgba(232, 197, 114, 0.95);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+#live-reticle::before {
+  left: 50%;
+  top: 0;
+  width: 2px;
+  height: 100%;
+  margin-left: -1px;
+}
+
+#live-reticle::after {
+  top: 50%;
+  left: 0;
+  height: 2px;
+  width: 100%;
+  margin-top: -1px;
+}
+
+#live-reticle[hidden] {
+  display: none;
+}
+
+#live-pill {
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  transform: translate(-50%, 22px);
+  z-index: 16;
+  max-width: min(86vw, 360px);
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(22, 23, 28, 0.92);
+  border: 1px solid rgba(244, 241, 234, 0.12);
+  color: var(--ink);
+  text-align: left;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+#live-pill[hidden] {
+  display: none;
+}
+
+#live-word {
+  display: block;
+  font-size: 1.15rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-transform: lowercase;
+}
+
+#live-def {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+#live-def:empty {
+  display: none;
+}
+
 .spinner {
   width: 36px;
   height: 36px;

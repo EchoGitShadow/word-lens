@@ -15,8 +15,10 @@
   const FLIP_WORDS_OK = 4;
   const OCR_MIN_SIDE = 2000;
   const OCR_MAX_SIDE = 2200;
-  const DISPLAY_MAX_SIDE = 2500;
+  const DISPLAY_MAX_SIDE = 3840;
+  const CAPTURE_MAX_SIDE = 3840;
   const SHOW_ALL_KEY = "word-lens-show-all";
+  const MODE_KEY = "word-lens-mode";
   const CACHE_KEY = "word-lens-def-cache-v2";
   const CACHE_LIMIT = 80;
   const TARGET_CAP_HEIGHT = 30;
@@ -48,6 +50,14 @@
   const sheetBody = $("sheet-body");
   const fileInput = $("file");
   const focusReticle = $("focus-reticle");
+  const liveReticle = $("live-reticle");
+  const livePill = $("live-pill");
+  const liveWordEl = $("live-word");
+  const liveDefEl = $("live-def");
+  const modeToggle = $("mode-toggle");
+  const modePhotoBtn = $("mode-photo");
+  const modeLiveBtn = $("mode-live");
+  const distanceHint = $("distance-hint");
 
   let stream = null;
   let busy = false;
@@ -65,11 +75,26 @@
   const letterCache = new Map();
   let pronunciation = { word: "", audioUrl: "", phonetic: "", abort: null, preloaded: null };
   let speakPlayer = null;
+  const knownWords = new Set();
+  let knownReady = Promise.resolve();
+  let scanMode = "photo";
+  let liveWorkerPromise = null;
+  let liveTimer = null;
+  let liveBusy = false;
+  let liveStable = { word: "", count: 0 };
+  let liveLineHeight = 0;
+  let lastLiveResult = null;
 
   try {
     showAll = localStorage.getItem(SHOW_ALL_KEY) === "1";
   } catch (err) {
     showAll = false;
+  }
+
+  try {
+    scanMode = localStorage.getItem(MODE_KEY) === "live" ? "live" : "photo";
+  } catch (err) {
+    scanMode = "photo";
   }
 
   try {
@@ -110,8 +135,7 @@
   function setMode(mode) {
     document.body.classList.remove("live", "frozen");
     if (mode) document.body.classList.add(mode);
-    if (mode === "live") show(steadyHint);
-    else hide(steadyHint);
+    applyScanModeUi();
   }
 
   function showToast(message, ms) {
@@ -130,15 +154,47 @@
     }
   }
 
-  function cameraConstraints() {
-    return {
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-      },
+  function scoreCameraLabel(label) {
+    const l = String(label || "").toLowerCase().trim();
+    if (!l) return 0;
+    if (/front|user|selfie|true.?depth|continuity/.test(l)) return -50;
+    if (/ultra\s*wide/.test(l)) return -20;
+    if (/tele(photo)?/.test(l)) return 5;
+    if (/dual|triple|desk\s*view/.test(l)) return -10;
+    if (l === "back camera") return 40;
+    if (/\bback camera\b/.test(l) && !/dual|triple|ultra|tele/.test(l.replace("back camera", ""))) return 35;
+    if (/back/.test(l) && /camera/.test(l) && !/dual|triple|ultra|front/.test(l)) return 20;
+    return 0;
+  }
+
+  async function preferBackWideDevice() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return null;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videos = devices.filter((d) => d && d.kind === "videoinput" && d.deviceId);
+      let best = null;
+      let bestScore = 0;
+      for (const device of videos) {
+        const score = scoreCameraLabel(device.label);
+        if (score > bestScore) {
+          bestScore = score;
+          best = device;
+        }
+      }
+      return bestScore >= 20 ? best : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function cameraConstraints(deviceId) {
+    const video = {
+      width: { ideal: 3840 },
+      height: { ideal: 2160 },
     };
+    if (deviceId) video.deviceId = { exact: deviceId };
+    else video.facingMode = { ideal: "environment" };
+    return { audio: false, video };
   }
 
   async function tightenCameraTrack(mediaStream) {
@@ -147,11 +203,11 @@
     try {
       const caps = typeof track.getCapabilities === "function" ? track.getCapabilities() : {};
       const next = {
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { ideal: 3840 },
+        height: { ideal: 2160 },
       };
-      if (caps.width && caps.width.max) next.width.ideal = Math.min(caps.width.max, 1920);
-      if (caps.height && caps.height.max) next.height.ideal = Math.min(caps.height.max, 1080);
+      if (caps.width && caps.width.max) next.width.ideal = Math.min(caps.width.max, CAPTURE_MAX_SIDE);
+      if (caps.height && caps.height.max) next.height.ideal = Math.min(caps.height.max, CAPTURE_MAX_SIDE);
       if (caps.focusMode && caps.focusMode.includes("continuous")) next.focusMode = "continuous";
       else if (caps.focusMode && caps.focusMode.includes("single-shot")) next.focusMode = "single-shot";
       await track.applyConstraints(next);
@@ -162,16 +218,48 @@
 
   async function startCamera() {
     stopCamera();
+    let preferred = null;
     try {
-      stream = await navigator.mediaDevices.getUserMedia(cameraConstraints());
+      preferred = await preferBackWideDevice();
     } catch (err) {
-      if (err && (err.name === "OverconstrainedError" || err.name === "NotFoundError")) {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { facingMode: "environment" },
-        });
-      } else {
+      preferred = null;
+    }
+    const openStream = async (deviceId) => {
+      try {
+        return await navigator.mediaDevices.getUserMedia(cameraConstraints(deviceId));
+      } catch (err) {
+        if (err && (err.name === "OverconstrainedError" || err.name === "NotFoundError")) {
+          if (deviceId) return navigator.mediaDevices.getUserMedia(cameraConstraints(null));
+          return navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: "environment" },
+          });
+        }
         throw err;
+      }
+    };
+    try {
+      stream = await openStream(preferred && preferred.deviceId);
+    } catch (err) {
+      throw err;
+    }
+    // After the first permission grant, iOS fills in device labels. Switch
+    // to the physical 1x wide camera if the virtual multi-cam was chosen.
+    if (!preferred) {
+      const found = await preferBackWideDevice();
+      if (found && found.deviceId) {
+        const currentId = stream.getVideoTracks()[0] && stream.getVideoTracks()[0].getSettings
+          ? stream.getVideoTracks()[0].getSettings().deviceId
+          : "";
+        if (currentId !== found.deviceId) {
+          try {
+            const locked = await openStream(found.deviceId);
+            for (const track of stream.getTracks()) track.stop();
+            stream = locked;
+          } catch (err) {
+            // Keep the stream we already have.
+          }
+        }
       }
     }
     await tightenCameraTrack(stream);
@@ -239,7 +327,6 @@
       hide(startEl);
       hide(retake);
       hide(toggleCommon);
-      show(shutter);
       show(controls);
       hide(tapHint);
       hide(boxesEl);
@@ -259,7 +346,7 @@
     const w = image.videoWidth || image.naturalWidth || image.width;
     const h = image.videoHeight || image.naturalHeight || image.height;
     if (!w || !h) throw new Error("Camera is not ready yet.");
-    const scale = Math.min(1, DISPLAY_MAX_SIDE / Math.max(w, h));
+    const scale = Math.min(1, CAPTURE_MAX_SIDE / Math.max(w, h));
     const dw = Math.max(1, Math.round(w * scale));
     const dh = Math.max(1, Math.round(h * scale));
     frame.width = dw;
@@ -340,7 +427,7 @@
       const url = URL.createObjectURL(file);
       const img = new Image();
       img.onload = () => {
-        const maxSide = DISPLAY_MAX_SIDE;
+        const maxSide = CAPTURE_MAX_SIDE;
         let w = img.naturalWidth;
         let h = img.naturalHeight;
         const scale = Math.min(1, maxSide / Math.max(w, h));
@@ -371,14 +458,30 @@
       .toLowerCase();
   }
 
+  function isKnownWord(word) {
+    if (!word) return false;
+    if (knownWords.has(word) || commonWords.has(word)) return true;
+    const lemmas = lemmaCandidates(word);
+    for (let i = 0; i < lemmas.length; i += 1) {
+      const lemma = lemmas[i];
+      if (knownWords.has(lemma) || commonWords.has(lemma)) return true;
+    }
+    return false;
+  }
+
   function isKeepableToken(raw, confidence) {
     const word = normalizeWord(raw);
     if (!word) return false;
     if (!/^[a-z]+(?:['-][a-z]+)*$/.test(word)) return false;
     const conf = confidence ?? 0;
-    if (word.length === 1) return (word === "a" || word === "i") && conf >= CONFIDENCE_LONG;
-    if (word.length <= 3) return conf >= CONFIDENCE_SHORT;
-    return conf >= CONFIDENCE_LONG;
+    const known = isKnownWord(word);
+    if (word.length === 1) {
+      if (word !== "a" && word !== "i") return false;
+      return known ? conf >= 28 : conf >= CONFIDENCE_LONG;
+    }
+    if (known) return conf >= (word.length <= 3 ? 28 : 22);
+    if (word.length <= 3) return conf >= 52;
+    return conf >= 50;
   }
 
   function isCommonWord(word) {
@@ -491,7 +594,17 @@
     return workerPromise;
   }
 
-  async function createWorkerWithFallback() {
+  async function getLiveWorker() {
+    if (!liveWorkerPromise) {
+      liveWorkerPromise = createWorkerWithFallback(true).catch((err) => {
+        liveWorkerPromise = null;
+        throw err;
+      });
+    }
+    return liveWorkerPromise;
+  }
+
+  async function createWorkerWithFallback(alwaysQuiet) {
     const cores = [
       `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESSERACT_CORE}/tesseract-core-simd-lstm.wasm.js`,
       `https://cdn.jsdelivr.net/npm/tesseract.js-core@${TESSERACT_CORE}/tesseract-core-lstm.wasm.js`,
@@ -501,7 +614,7 @@
       try {
         return await Tesseract.createWorker("eng", 1, {
           logger: (m) => {
-            if (quietOcr) return;
+            if (alwaysQuiet || quietOcr) return;
             if (typeof progressHandler === "function") progressHandler(m);
           },
           workerPath: `https://cdn.jsdelivr.net/npm/tesseract.js@${TESSERACT_VERSION}/dist/worker.min.js`,
@@ -766,6 +879,40 @@
     return canvas;
   }
 
+  function blurGrayLarge(gray, w, h) {
+    const src = grayToCanvas(gray, w, h);
+    const smallW = Math.max(16, Math.round(w / 24));
+    const smallH = Math.max(16, Math.round(h / 24));
+    const small = document.createElement("canvas");
+    small.width = smallW;
+    small.height = smallH;
+    const sctx = small.getContext("2d");
+    sctx.imageSmoothingEnabled = true;
+    sctx.imageSmoothingQuality = "high";
+    sctx.drawImage(src, 0, 0, smallW, smallH);
+    const big = document.createElement("canvas");
+    big.width = w;
+    big.height = h;
+    const bctx = big.getContext("2d", { willReadFrequently: true });
+    bctx.imageSmoothingEnabled = true;
+    bctx.imageSmoothingQuality = "high";
+    bctx.drawImage(small, 0, 0, w, h);
+    const data = bctx.getImageData(0, 0, w, h).data;
+    const out = new Uint8Array(w * h);
+    for (let p = 0, i = 0; p < out.length; p += 1, i += 4) out[p] = data[i];
+    return out;
+  }
+
+  function flattenGray(gray, illumination) {
+    const out = new Uint8Array(gray.length);
+    for (let i = 0; i < gray.length; i += 1) {
+      const b = illumination[i] < 8 ? 8 : illumination[i];
+      const v = (gray[i] * 230) / b;
+      out[i] = v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    }
+    return out;
+  }
+
   function preprocessForOcr(source) {
     const w = source.width;
     const h = source.height;
@@ -789,10 +936,15 @@
       chL[p] = (r * 299 + g * 587 + b * 114) / 1000;
       chM[p] = r < g ? (r < b ? r : b) : g < b ? g : b;
     }
+    const illumination = blurGrayLarge(chL, w, h);
+    const illumHist = histogram(illumination);
+    const illumSpread = percentileFromHist(illumHist, n, 0.9) - percentileFromHist(illumHist, n, 0.1);
+    const flatten = illumSpread >= 40;
     let best = chL;
     let bestScore = -1;
     for (const channel of [chR, chG, chB, chL, chM]) {
-      const stretched = stretchChannel(channel);
+      const prepared = flatten ? flattenGray(channel, illumination) : channel;
+      const stretched = stretchChannel(prepared);
       const hist = histogram(stretched);
       const score = otsuThreshold(hist, n).score;
       if (score > bestScore) {
@@ -997,10 +1149,17 @@
       }
     }
     if (inRun) runs.push(h - start);
-    let lineHeights = runs.filter((v) => v >= 6 && v <= h * 0.4);
-    if (lineHeights.length >= 2) {
+    let lineHeights = runs.filter((v) => v >= 6 && v <= h * 0.22);
+    if (lineHeights.length >= 4) {
+      const sorted = lineHeights.slice().sort((a, b) => a - b);
+      const q1 = sorted[Math.floor(sorted.length * 0.25)];
+      const q3 = sorted[Math.floor(sorted.length * 0.75)] || q1;
+      const iqr = Math.max(3, q3 - q1);
+      const tight = lineHeights.filter((v) => v >= q1 - iqr && v <= q3 + iqr);
+      if (tight.length >= 3) lineHeights = tight;
+    } else if (lineHeights.length >= 2) {
       const med = medianOdd(lineHeights);
-      lineHeights = lineHeights.filter((v) => v >= med * 0.55);
+      lineHeights = lineHeights.filter((v) => v >= med * 0.55 && v <= med * 1.8);
     }
 
     if (!lineHeights.length) return { capHeight: 0, lineCount: 0, inkFrac };
@@ -1027,8 +1186,10 @@
     };
   }
 
-  function scaleFactorsForCap(prepared, capHeight) {
+  function scaleFactorsForCap(prepared, capHeight, lineCount) {
     const factors = [1];
+    // A many-line page is not a close-up; a wild cap estimate is usually merged lines.
+    if ((lineCount || 0) >= 8) return factors;
     if (!capHeight || capHeight <= CAP_HEIGHT_MAX) return factors;
     const longSide = Math.max(prepared.canvas.width, prepared.canvas.height);
     let factor = TARGET_CAP_HEIGHT / capHeight;
@@ -1289,6 +1450,87 @@
       });
   }
 
+  function cropCanvas(source, rect) {
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, rect.w);
+    canvas.height = Math.max(1, rect.h);
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(source, rect.x, rect.y, rect.w, rect.h, 0, 0, rect.w, rect.h);
+    return canvas;
+  }
+
+  function bandRects(width, height, bands, overlap) {
+    const count = Math.max(2, bands);
+    const frac = overlap == null ? 0.28 : overlap;
+    const denom = count - (count - 1) * frac;
+    const bh = Math.ceil(height / denom);
+    const step = Math.max(1, Math.round(bh * (1 - frac)));
+    const rects = [];
+    let y = 0;
+    for (let i = 0; i < count; i += 1) {
+      const y0 = Math.min(y, Math.max(0, height - bh));
+      const h = Math.min(height - y0, bh);
+      rects.push({ x: 0, y: y0, w: width, h });
+      y += step;
+    }
+    const last = rects[rects.length - 1];
+    if (last && last.y + last.h < height) {
+      last.h = height - last.y;
+    }
+    return rects;
+  }
+
+  function boxIoU(a, b) {
+    const ax0 = a.cx - a.width / 2;
+    const ay0 = a.cy - a.height / 2;
+    const ax1 = a.cx + a.width / 2;
+    const ay1 = a.cy + a.height / 2;
+    const bx0 = b.cx - b.width / 2;
+    const by0 = b.cy - b.height / 2;
+    const bx1 = b.cx + b.width / 2;
+    const by1 = b.cy + b.height / 2;
+    const ix0 = Math.max(ax0, bx0);
+    const iy0 = Math.max(ay0, by0);
+    const ix1 = Math.min(ax1, bx1);
+    const iy1 = Math.min(ay1, by1);
+    const iw = Math.max(0, ix1 - ix0);
+    const ih = Math.max(0, iy1 - iy0);
+    const inter = iw * ih;
+    const union = Math.max(1, a.width * a.height + b.width * b.height - inter);
+    return inter / union;
+  }
+
+  function mergeWordLists(lists) {
+    const all = lists.flat().sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    const kept = [];
+    for (const word of all) {
+      const hit = kept.find((other) => {
+        if (boxIoU(word, other) >= 0.4) return true;
+        if (word.word === other.word) {
+          const dist = Math.hypot(word.cx - other.cx, word.cy - other.cy);
+          return dist < Math.max(word.width, other.width, 8) * 0.7;
+        }
+        return false;
+      });
+      if (!hit) kept.push(word);
+    }
+    return kept;
+  }
+
+  function scoreWords(words) {
+    const keepable = words.length;
+    const avgConf = keepable
+      ? words.reduce((sum, w) => sum + (w.confidence || 0), 0) / keepable
+      : 0;
+    const longWords = words.filter((w) => (w.word || "").length >= 5).length;
+    return {
+      keepable,
+      longWords,
+      avgConf,
+      total: keepable * 8 + longWords * 6 + avgConf,
+    };
+  }
+
   async function recognizeAt(processed, angle, psm, prepared) {
     const normalized = ((angle % 360) + 360) % 360;
     const needsRotate = Math.min(normalized, 360 - normalized) >= 0.5;
@@ -1299,67 +1541,130 @@
     return { words, score, angle, psm, rotW: ocrCanvas.width, rotH: ocrCanvas.height };
   }
 
+  async function recognizeBand(processed, rect, prepared) {
+    const slice = cropCanvas(processed, rect);
+    let angle = findLineAngle(slice);
+    if (Math.abs(angle) > 15) angle = 0;
+    if (Math.abs(angle) < 1.5) angle = 0;
+    const bandPrepared = {
+      canvas: slice,
+      scaleX: prepared.scaleX,
+      scaleY: prepared.scaleY,
+      offsetX: prepared.offsetX + rect.x / prepared.scaleX,
+      offsetY: prepared.offsetY + rect.y / prepared.scaleY,
+    };
+    return recognizeAt(slice, angle, 6, bandPrepared);
+  }
+
+  async function recognizeInBands(processed, prepared) {
+    const rects = bandRects(processed.width, processed.height, 3, 0.3);
+    const groups = [];
+    for (let i = 0; i < rects.length; i += 1) {
+      loadingText.textContent = `Reading words… ${i + 1}/${rects.length}`;
+      const result = await recognizeBand(processed, rects[i], prepared);
+      groups.push(result.words);
+    }
+    const words = mergeWordLists(groups);
+    const score = scoreWords(words);
+    return { words, score, angle: 0, psm: 6, rotW: processed.width, rotH: processed.height, scale: 1, bands: rects.length };
+  }
+
   async function recognizeFrame() {
     await commonReady;
+    try {
+      await Promise.race([knownReady, new Promise((resolve) => setTimeout(resolve, 1200))]);
+    } catch (err) {
+      // proceed with whatever of the word list has loaded
+    }
     loadingText.textContent = "Enhancing photo…";
     const base = prepareOcrSource(frame);
+    // Estimate lines and skew on the unflattened page. Shadow flattening
+    // evens the paper so much that a global threshold can merge every line.
     const metrics = estimateTextMetrics(base.canvas);
-    const factors = scaleFactorsForCap(base, metrics.capHeight);
-    const closeUp = metrics.capHeight > CAP_HEIGHT_MAX;
+    const cap = metrics.capHeight || 0;
+    const densePage = (metrics.lineCount || 0) >= 8
+      || (cap > 0 && cap <= CAP_HEIGHT_MAX
+        && frame.height > frame.width * 1.15
+        && Math.max(frame.width, frame.height) >= 1000);
+    const factors = scaleFactorsForCap(base, metrics.capHeight, metrics.lineCount);
+    const closeUp = !densePage && metrics.capHeight > CAP_HEIGHT_MAX;
     const prepared = withPreparedScale(base, factors[0]);
     const processed = unsharpCanvas(preprocessForOcr(prepared.canvas));
     loadingText.textContent = "Finding orientation…";
-    const lineAngle = findLineAngle(processed);
-    loadingText.textContent = "Checking orientation…";
-    const chosen = await chooseReadingAngle(processed, lineAngle);
-    const firstPsm = closeUp ? 6 : 3;
-    let best = await recognizeAt(processed, chosen.angle, firstPsm, prepared);
-    best.scale = factors[0];
-    const nearlyZero = Math.min(((chosen.angle % 360) + 360) % 360, 360 - (((chosen.angle % 360) + 360) % 360)) < 0.5;
-    if (isWeakScore(best.score) && !nearlyZero) {
-      loadingText.textContent = "Trying another read…";
-      const zero = await recognizeAt(processed, 0, firstPsm, prepared);
-      if (zero.score.total >= best.score.total) {
-        best = zero;
-        best.scale = factors[0];
-      }
+    const rawLineAngle = findLineAngle(prepared.canvas);
+    const folded = ((rawLineAngle % 180) + 180) % 180;
+    const nearCardinal90 = Math.abs(folded - 90) <= 18;
+    const nearUpright = Math.min(folded, 180 - folded) < 3;
+    // Ignore messy mid-range skew on curved book pages, but keep 90° turns.
+    const lineAngle = densePage && !nearUpright && !nearCardinal90 ? 0 : rawLineAngle;
+    let chosen;
+    if (densePage && nearUpright && !nearCardinal90) {
+      chosen = { angle: 0 };
+    } else {
+      loadingText.textContent = "Checking orientation…";
+      chosen = await chooseReadingAngle(processed, lineAngle);
     }
-    if (isWeakScore(best.score)) {
-      loadingText.textContent = "Trying another read…";
-      const sparse = await recognizeAt(processed, 0, 11, prepared);
-      if (sparse.score.total >= best.score.total) {
-        best = sparse;
-        best.scale = factors[0];
+
+    let best;
+    if (densePage && !nearCardinal90) {
+      loadingText.textContent = "Reading words…";
+      best = await recognizeInBands(processed, prepared);
+      best.scale = 1;
+      if (isWeakScore(best.score)) {
+        const full = await recognizeAt(processed, chosen.angle, 6, prepared);
+        full.scale = 1;
+        if (full.score.total > best.score.total) best = full;
       }
-    }
-    if (isWeakScore(best.score) && !nearlyZero) {
-      const sparseTilt = await recognizeAt(processed, chosen.angle, 11, prepared);
-      if (sparseTilt.score.total > best.score.total) {
-        best = sparseTilt;
-        best.scale = factors[0];
+    } else {
+      const firstPsm = closeUp ? 6 : 3;
+      best = await recognizeAt(processed, chosen.angle, firstPsm, prepared);
+      best.scale = factors[0];
+      const nearlyZero = Math.min(((chosen.angle % 360) + 360) % 360, 360 - (((chosen.angle % 360) + 360) % 360)) < 0.5;
+      if (isWeakScore(best.score) && !nearlyZero) {
+        loadingText.textContent = "Trying another read…";
+        const zero = await recognizeAt(processed, 0, firstPsm, prepared);
+        if (zero.score.total >= best.score.total) {
+          best = zero;
+          best.scale = factors[0];
+        }
       }
-    }
-    if (isWeakScore(best.score)) {
-      const nextPsm = firstPsm === 6 ? 3 : 6;
-      const block = await recognizeAt(processed, best.angle, nextPsm, prepared);
-      if (block.score.total >= best.score.total) {
-        best = block;
-        best.scale = factors[0];
+      if (isWeakScore(best.score)) {
+        loadingText.textContent = "Trying another read…";
+        const sparse = await recognizeAt(processed, 0, 11, prepared);
+        if (sparse.score.total >= best.score.total) {
+          best = sparse;
+          best.scale = factors[0];
+        }
       }
-    }
-    if (isWeakScore(best.score) && factors.length > 1) {
-      loadingText.textContent = "Trying another scale…";
-      for (const factor of factors.slice(1)) {
-        const prep = withPreparedScale(base, factor);
-        const proc = unsharpCanvas(preprocessForOcr(prep.canvas));
-        const psms = closeUp ? [6, 11, 3] : [3, 11, 6];
-        for (const psm of psms) {
-          const attempt = await recognizeAt(proc, chosen.angle, psm, prep);
-          attempt.scale = factor;
-          if (attempt.score.total > best.score.total) best = attempt;
+      if (isWeakScore(best.score) && !nearlyZero) {
+        const sparseTilt = await recognizeAt(processed, chosen.angle, 11, prepared);
+        if (sparseTilt.score.total > best.score.total) {
+          best = sparseTilt;
+          best.scale = factors[0];
+        }
+      }
+      if (isWeakScore(best.score)) {
+        const nextPsm = firstPsm === 6 ? 3 : 6;
+        const block = await recognizeAt(processed, best.angle, nextPsm, prepared);
+        if (block.score.total >= best.score.total) {
+          best = block;
+          best.scale = factors[0];
+        }
+      }
+      if (isWeakScore(best.score) && factors.length > 1) {
+        loadingText.textContent = "Trying another scale…";
+        for (const factor of factors.slice(1)) {
+          const prep = withPreparedScale(base, factor);
+          const proc = unsharpCanvas(preprocessForOcr(prep.canvas));
+          const psms = closeUp ? [6, 11, 3] : [3, 11, 6];
+          for (const psm of psms) {
+            const attempt = await recognizeAt(proc, chosen.angle, psm, prep);
+            attempt.scale = factor;
+            if (attempt.score.total > best.score.total) best = attempt;
+            if (!isWeakScore(best.score)) break;
+          }
           if (!isWeakScore(best.score)) break;
         }
-        if (!isWeakScore(best.score)) break;
       }
     }
     lastWords = best.words;
@@ -1373,6 +1678,8 @@
       rotH: best.rotH,
       capHeight: Math.round(metrics.capHeight || 0),
       scale: best.scale || factors[0],
+      lineCount: metrics.lineCount || 0,
+      bands: best.bands || 0,
     };
     return best.words;
   }
@@ -1539,6 +1846,15 @@
     const data = await pending;
     letterCache.set(letter, data);
     return data;
+  }
+
+  function startKnownWordsLoad() {
+    knownReady = Promise.all(
+      "abcdefghijklmnopqrstuvwxyz".split("").map(async (letter) => {
+        const data = await loadLetterDict(letter);
+        for (const key of Object.keys(data || {})) knownWords.add(key);
+      })
+    ).catch(() => {});
   }
 
   function localToEntries(word, rec) {
@@ -2160,7 +2476,6 @@
       console.error(err);
     }
     hide(retake);
-    show(shutter);
     setMode("live");
   }
 
@@ -2212,11 +2527,318 @@
     }
   }
 
+
+  function persistScanMode() {
+    try {
+      localStorage.setItem(MODE_KEY, scanMode);
+    } catch (err) {
+      // ignore
+    }
+  }
+
+  function setScanMode(mode) {
+    scanMode = mode === "live" ? "live" : "photo";
+    persistScanMode();
+    applyScanModeUi();
+  }
+
+  function sheetIsOpen() {
+    return sheet && !sheet.hidden && sheet.classList.contains("open");
+  }
+
+  function clearLivePill() {
+    liveStable = { word: "", count: 0 };
+    if (liveWordEl) liveWordEl.textContent = "";
+    if (liveDefEl) liveDefEl.textContent = "";
+    if (livePill) hide(livePill);
+  }
+
+  function applyScanModeUi() {
+    const previewing = document.body.classList.contains("live");
+    const scanning = previewing && scanMode === "live";
+    if (modePhotoBtn) modePhotoBtn.setAttribute("aria-pressed", scanMode === "photo" ? "true" : "false");
+    if (modeLiveBtn) modeLiveBtn.setAttribute("aria-pressed", scanMode === "live" ? "true" : "false");
+    if (modeToggle) {
+      if (previewing) show(modeToggle);
+      else hide(modeToggle);
+    }
+    if (distanceHint) {
+      if (previewing) show(distanceHint);
+      else hide(distanceHint);
+    }
+    if (scanning) {
+      hide(shutter);
+      hide(steadyHint);
+      hide(tapHint);
+      if (liveReticle) show(liveReticle);
+      startLiveLoop();
+    } else {
+      if (liveReticle) hide(liveReticle);
+      clearLivePill();
+      stopLiveLoop();
+      if (previewing) {
+        show(shutter);
+        show(steadyHint);
+      } else {
+        hide(steadyHint);
+      }
+    }
+  }
+
+  function stopLiveLoop() {
+    if (liveTimer) {
+      clearTimeout(liveTimer);
+      liveTimer = null;
+    }
+  }
+
+  function startLiveLoop() {
+    stopLiveLoop();
+    getLiveWorker().catch(() => {});
+    const tick = async () => {
+      try {
+        await liveTick();
+      } catch (err) {
+        // Keep the loop alive if a single frame fails.
+      }
+      if (scanMode === "live" && document.body.classList.contains("live")) {
+        liveTimer = setTimeout(tick, 500);
+      }
+    };
+    liveTimer = setTimeout(tick, 180);
+  }
+
+  function scaleCanvasTo(source, factor) {
+    const w = Math.max(1, Math.round(source.width * factor));
+    const h = Math.max(1, Math.round(source.height * factor));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(source, 0, 0, w, h);
+    return canvas;
+  }
+
+  function isLiveKeepable(text, confidence) {
+    if (isKeepableToken(text, confidence)) return true;
+    const cleaned = normalizeWord(text);
+    // Long proper names often sit outside the 80k dictionary.
+    return cleaned.length >= 8 && confidence >= 32 && /[a-z]{8,}/i.test(cleaned);
+  }
+
+  function liveWordsFromData(data) {
+    return (data.words || [])
+      .filter((w) => isLiveKeepable(w.text, w.confidence ?? 0))
+      .map((w) => ({
+        word: normalizeWord(w.text),
+        confidence: w.confidence || 0,
+        x0: w.bbox.x0,
+        y0: w.bbox.y0,
+        x1: w.bbox.x1,
+        y1: w.bbox.y1,
+        cx: (w.bbox.x0 + w.bbox.x1) / 2,
+        cy: (w.bbox.y0 + w.bbox.y1) / 2,
+        width: Math.max(1, w.bbox.x1 - w.bbox.x0),
+        height: Math.max(1, w.bbox.y1 - w.bbox.y0),
+      }));
+  }
+
+  function joinSplitLiveWords(words) {
+    if (words.length < 2) return words;
+    const sorted = words.slice().sort((a, b) => a.cy - b.cy || a.x0 - b.x0);
+    const joined = [];
+    let cur = { ...sorted[0] };
+    for (let i = 1; i < sorted.length; i += 1) {
+      const next = sorted[i];
+      const sameLine = Math.abs(cur.cy - next.cy) <= Math.max(cur.height, next.height) * 0.35;
+      const gap = next.x0 - cur.x1;
+      const tight = gap >= -3 && gap <= Math.max(3, Math.max(cur.height, next.height) * 0.12);
+      const left = cur.word || "";
+      const right = next.word || "";
+      const piece = (left.length <= 4 || right.length <= 4) && !(isKnownWord(left) && isKnownWord(right));
+      if (sameLine && tight && piece && (left + right).length >= 6 && (left + right).length <= 18) {
+        cur = {
+          word: normalizeWord(left + right),
+          confidence: Math.min(cur.confidence || 0, next.confidence || 0),
+          x0: Math.min(cur.x0, next.x0),
+          y0: Math.min(cur.y0, next.y0),
+          x1: Math.max(cur.x1, next.x1),
+          y1: Math.max(cur.y1, next.y1),
+          cx: (Math.min(cur.x0, next.x0) + Math.max(cur.x1, next.x1)) / 2,
+          cy: (Math.min(cur.y0, next.y0) + Math.max(cur.y1, next.y1)) / 2,
+          width: Math.max(1, Math.max(cur.x1, next.x1) - Math.min(cur.x0, next.x0)),
+          height: Math.max(1, Math.max(cur.y1, next.y1) - Math.min(cur.y0, next.y0)),
+        };
+      } else {
+        joined.push(cur);
+        cur = { ...next };
+      }
+    }
+    joined.push(cur);
+    return mergeWordLists([words, joined]);
+  }
+
+  function pickLiveWord(words, cx, cy) {
+    if (!words.length) return null;
+    const inside = words.filter((w) => cx >= w.x0 && cx <= w.x1 && cy >= w.y0 && cy <= w.y1);
+    const pool = inside.length ? inside : words;
+    let best = pool[0];
+    let bestScore = Infinity;
+    for (const word of pool) {
+      const dist = Math.hypot(word.cx - cx, word.cy - cy);
+      const area = Math.max(1, word.width * word.height);
+      const shortPenalty = !inside.length && (word.word || "").length <= 3 ? (word.height || 12) * 0.85 : 0;
+      // When the reticle sits in more than one box, keep the tightest word.
+      const score = inside.length ? area + dist * 0.25 : dist + shortPenalty;
+      if (score < bestScore || (score === bestScore && (word.confidence || 0) > (best.confidence || 0))) {
+        best = word;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  async function recognizeLiveCanvas(source, localX, localY) {
+    const started = typeof performance !== "undefined" ? performance.now() : Date.now();
+    await Promise.race([knownReady, new Promise((resolve) => setTimeout(resolve, 400))]).catch(() => {});
+    const metrics = estimateTextMetrics(source);
+    let work = source;
+    if (metrics.capHeight > 0) {
+      const factor = Math.max(0.5, Math.min(3.2, TARGET_CAP_HEIGHT / metrics.capHeight));
+      if (Math.abs(factor - 1) > 0.12) work = scaleCanvasTo(source, factor);
+    } else if (Math.max(source.width, source.height) < 520) {
+      work = scaleCanvasTo(source, 520 / Math.max(source.width, source.height));
+    }
+    const processed = unsharpCanvas(preprocessForOcr(work));
+    const worker = await getLiveWorker();
+    const first = await worker.recognize(processed, { tessedit_pageseg_mode: "7" });
+    let words = liveWordsFromData(first.data || first);
+    const second = await worker.recognize(processed, { tessedit_pageseg_mode: "6" });
+    const more = liveWordsFromData(second.data || second);
+    words = mergeWordLists([words, more]);
+    words = joinSplitLiveWords(words);
+    const sx = processed.width / source.width;
+    const sy = processed.height / source.height;
+    const aimX = localX == null ? processed.width / 2 : localX * sx;
+    const aimY = localY == null ? processed.height / 2 : localY * sy;
+    const picked = pickLiveWord(words, aimX, aimY);
+    const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - started;
+    const scaleY = source.height / processed.height;
+    const lineHeights = words.map((w) => w.height * scaleY).filter((h) => h >= 8 && h <= source.height * 0.7).sort((a, b) => a - b);
+    if (lineHeights.length) {
+      const mid = lineHeights[Math.floor(lineHeights.length / 2)];
+      liveLineHeight = mid;
+    } else if (picked && picked.height) {
+      const guessH = picked.height * scaleY;
+      if (guessH >= 8 && guessH <= source.height * 0.7) liveLineHeight = guessH;
+    }
+    return {
+      word: picked ? picked.word : "",
+      picked,
+      words,
+      latency: Math.round(elapsed),
+      capHeight: Math.round(metrics.capHeight || 0),
+    };
+  }
+
+  function grabCenteredPatch(image, cx, cy, vw, vh) {
+    const guess = liveLineHeight ? liveLineHeight * 3.0 : Math.min(vh * 0.09, 140);
+    const ch = Math.max(56, Math.min(Math.round(vh * 0.18), Math.round(guess)));
+    const cw = Math.max(120, Math.round(Math.min(vw * 0.62, Math.max(vw * 0.4, ch * 6))));
+    const x = Math.max(0, Math.min(vw - cw, Math.round(cx - cw / 2)));
+    const y = Math.max(0, Math.min(vh - ch, Math.round(cy - ch / 2)));
+    const canvas = document.createElement("canvas");
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(image, x, y, cw, ch, 0, 0, cw, ch);
+    return { canvas, localX: cx - x, localY: cy - y };
+  }
+
+  async function recognizeLiveFrame() {
+    const vw = preview.videoWidth;
+    const vh = preview.videoHeight;
+    if (!vw || !vh) return null;
+    const patch = grabCenteredPatch(preview, vw / 2, vh / 2, vw, vh);
+    return recognizeLiveCanvas(patch.canvas, patch.localX, patch.localY);
+  }
+
+  async function showLiveDefinition(word) {
+    if (!word || !liveDefEl) return;
+    try {
+      const data = await fetchDefinition(word);
+      if (liveStable.word !== word) return;
+      const first = Array.isArray(data) ? data[0] : data;
+      const meaning = ((first && first.meanings) || [])[0] || {};
+      const def = ((((meaning.definitions || [])[0] || {}).definition) || "").trim();
+      liveDefEl.textContent = def.length > 110 ? def.slice(0, 107).trim() + "…" : def;
+    } catch (err) {
+      if (liveStable.word === word && liveDefEl) liveDefEl.textContent = "";
+    }
+  }
+
+  function updateLivePill(word) {
+    if (!word) {
+      clearLivePill();
+      return;
+    }
+    if (liveStable.word === word) liveStable.count += 1;
+    else liveStable = { word, count: 1 };
+    if (liveStable.count < 2) return;
+    if (liveWordEl) liveWordEl.textContent = word;
+    if (livePill) show(livePill);
+    if (liveStable.count === 2) showLiveDefinition(word);
+  }
+
+  async function liveTick() {
+    if (liveBusy) return;
+    if (scanMode !== "live") return;
+    if (!document.body.classList.contains("live")) return;
+    if (document.hidden) return;
+    if (sheetIsOpen()) return;
+    if (!preview.videoWidth) return;
+    liveBusy = true;
+    try {
+      const result = await recognizeLiveFrame();
+      lastLiveResult = result;
+      if (result && result.word) updateLivePill(result.word);
+      else if (liveStable.count && liveStable.word) {
+        // Keep the last stable pill briefly; do not flicker off on one empty frame.
+        liveStable.count = Math.max(2, liveStable.count - 1);
+      } else {
+        clearLivePill();
+      }
+    } finally {
+      liveBusy = false;
+    }
+  }
+
+  function onLivePillClick(ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const word = (liveWordEl && liveWordEl.textContent) || liveStable.word;
+    if (word) openSheet(word);
+  }
+
+  async function recognizeLiveRegionFromImage(image, cx, cy) {
+    const vw = image.naturalWidth || image.videoWidth || image.width;
+    const vh = image.naturalHeight || image.videoHeight || image.height;
+    const px = cx <= 1 ? cx * vw : cx;
+    const py = cy <= 1 ? cy * vh : cy;
+    const patch = grabCenteredPatch(image, px, py, vw, vh);
+    return recognizeLiveCanvas(patch.canvas, patch.localX, patch.localY);
+  }
+
   $("open-camera").addEventListener("click", openLiveCamera);
   $("choose-photo").addEventListener("click", onChoosePhoto);
   shutter.addEventListener("click", onShutter);
   retake.addEventListener("click", onRetake);
   toggleCommon.addEventListener("click", () => setShowAll(!showAll));
+  if (modePhotoBtn) modePhotoBtn.addEventListener("click", () => setScanMode("photo"));
+  if (modeLiveBtn) modeLiveBtn.addEventListener("click", () => setScanMode("live"));
+  if (livePill) livePill.addEventListener("click", onLivePillClick);
   fileInput.addEventListener("change", onFileChange);
   $("sheet-close").addEventListener("click", () => closeSheet());
   sheetSpeak.addEventListener("click", onSpeakClick);
@@ -2254,8 +2876,31 @@
   }
 
   updateToggleLabel();
+  startKnownWordsLoad();
 
   window.__wordLensTest = {
+    isKnownWord,
+    setScanMode,
+    getScanMode() {
+      return scanMode;
+    },
+    async recognizeLiveRegion(blob, cx, cy) {
+      const url = URL.createObjectURL(blob);
+      try {
+        const img = await new Promise((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error("Couldn’t read that image."));
+          image.src = url;
+        });
+        return recognizeLiveRegionFromImage(img, cx, cy);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    },
+    getLastLiveResult() {
+      return lastLiveResult;
+    },
     normalizeWord,
     isKeepableToken,
     isCommonWord,

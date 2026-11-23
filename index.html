@@ -47,11 +47,22 @@
     <p id="steady-hint" hidden>Hold steady, then tap</p>
     <div id="focus-reticle" hidden></div>
 
+    <div id="live-reticle" hidden aria-hidden="true"></div>
+    <button id="live-pill" type="button" hidden>
+      <span id="live-word"></span>
+      <span id="live-def"></span>
+    </button>
+
     <div id="controls" hidden>
+      <div id="mode-toggle">
+        <button id="mode-photo" type="button" aria-pressed="true">Photo</button>
+        <button id="mode-live" type="button" aria-pressed="false">Live</button>
+      </div>
       <button id="shutter" type="button" aria-label="Capture"></button>
       <button id="retake" type="button" hidden>Retake</button>
       <button id="toggle-common" type="button" hidden aria-pressed="false">Show all</button>
     </div>
+    <p id="distance-hint" hidden>Hold a bit farther back</p>
 
     <div id="sheet" hidden>
       <div id="sheet-backdrop"></div>
